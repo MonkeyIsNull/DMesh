@@ -1,0 +1,28 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+/dmesh
+/bin/
+/dist/
+
+# Test & build output
+*.test
+*.out
+*.prof
+coverage.*
+
+# Go
+/vendor/
+go.work
+go.work.sum
+
+# macOS
+.DS_Store
+
+# Editors
+.idea/
+.vscode/
+*.swp
+*.bak
