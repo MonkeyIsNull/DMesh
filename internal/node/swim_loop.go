@@ -329,6 +329,13 @@ func (n *Node) handleSessReady(m sessReadyMsg) {
 		env := swim.Envelope{Kind: swim.KindSync, Seq: seq, Updates: burst}
 		n.sealSend(addr, m.sess, encodeSwim(swim.Encode(env)))
 	}
+
+	// v0.3 resume hook: a (re)connected transport for this identity is now bound.
+	// Bump the session epoch and re-attach every session anchored to this peer,
+	// resuming any that were paused. OnTransportReady no-ops on an unchanged epoch.
+	if !peerID.IsZero() {
+		n.resumeSessions(peerID, now)
+	}
 }
 
 // handleLeave announces a graceful departure: bump+persist the incarnation,

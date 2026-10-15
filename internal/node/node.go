@@ -23,6 +23,7 @@ import (
 	"github.com/MonkeyIsNull/DMesh/internal/clock"
 	"github.com/MonkeyIsNull/DMesh/internal/discovery"
 	"github.com/MonkeyIsNull/DMesh/internal/identity"
+	"github.com/MonkeyIsNull/DMesh/internal/session"
 	"github.com/MonkeyIsNull/DMesh/internal/swim"
 	"github.com/MonkeyIsNull/DMesh/internal/transport"
 )
@@ -74,6 +75,15 @@ type Config struct {
 	// ManualSwimPhases disables the internal phase-timer goroutine; the test
 	// harness injects period phases on InjectPhase instead.
 	ManualSwimPhases bool
+	// ManualSessionTick disables the internal session-tick timer goroutine; the
+	// test harness injects ticks on InjectSessionTick instead.
+	ManualSessionTick bool
+	// SessionParams overrides the durable-session tunables; the zero value uses
+	// session.DefaultParams().
+	SessionParams session.Params
+	// SessionTickInterval overrides the production session-tick cadence (0 =
+	// default).
+	SessionTickInterval time.Duration
 	// DisableKeepalive turns off the per-peer keepalive (tests drive liveness
 	// purely through SWIM probes).
 	DisableKeepalive bool
@@ -103,11 +113,15 @@ type Node struct {
 	byID   map[identity.NodeID]*peer
 	half   *transport.HalfOpenTable
 
+	// connMu guards conn so a roam (RebindConnForTest / a real socket rebind) can
+	// swap the bound PacketConn under the running read/send paths.
+	connMu sync.Mutex
+
 	inbound   chan inPkt
 	hints     chan discovery.PeerHint
 	auth      chan *authReq
 	lastSeen  chan lsUpdate
-	done      chan netip.AddrPort
+	done      chan doneMsg
 	forceDial chan forceDialReq
 
 	// --- v0.2 SWIM state, owned exclusively by the loop goroutine ---
@@ -132,6 +146,24 @@ type Node struct {
 	swimIn    chan swimInbound
 	swimPhase chan int
 	leaveCh   chan chan struct{}
+
+	// --- v0.3 durable sessions, owned exclusively by the loop goroutine ---
+	sessions   map[session.SessionID]*liveSession
+	sessByPeer map[identity.NodeID]map[session.SessionID]struct{}
+	sessEpoch  map[identity.NodeID]uint64
+	sessParams session.Params
+	accept     chan *Session
+	sessIn     chan sessInbound
+	sessCtl    chan sessCtlReq
+	sessTick   chan struct{}
+
+	manualSessionTick   bool
+	sessionTickInterval time.Duration
+	// runCtx is the node's run context, captured at the top of Run so loop
+	// handlers can spawn transport dials (forced re-dials) with the right lifetime
+	// without threading ctx through every call. Written once before the loop
+	// starts, read only by the loop goroutine.
+	runCtx context.Context
 
 	// sim is the deterministic-test happens-before barrier. It is nil in
 	// production (every call is a cheap nil-guarded no-op) and set by the
@@ -181,6 +213,14 @@ type relayReq struct {
 type sessReadyMsg struct {
 	addr netip.AddrPort
 	sess *transport.Session
+}
+
+// doneMsg carries the identity of the session driver that exited, so the loop's
+// handleDone only retires the address keys if they still point at THAT peer and
+// not at a newer session that reused the same address.
+type doneMsg struct {
+	addr netip.AddrPort
+	p    *peer
 }
 
 type swimInbound struct {
@@ -268,7 +308,7 @@ func New(cfg Config) (*Node, error) {
 		hints:             make(chan discovery.PeerHint, 64),
 		auth:              make(chan *authReq, 16),
 		lastSeen:          make(chan lsUpdate, 256),
-		done:              make(chan netip.AddrPort, 64),
+		done:              make(chan doneMsg, 64),
 		forceDial:         make(chan forceDialReq, 64),
 		params:            params,
 		gossip:            swim.NewBuffer(gossipBufferCap(params)),
@@ -287,6 +327,27 @@ func New(cfg Config) (*Node, error) {
 		swimIn:            make(chan swimInbound, 256),
 		swimPhase:         make(chan int, 8),
 		leaveCh:           make(chan chan struct{}, 1),
+	}
+
+	// Fill every zero-valued field from DefaultParams so a caller who overrides a
+	// single tunable still gets sane session caps / backlog. A plain MaxChunk==0
+	// guard left the node reading un-defaulted caps (a zero MaxTotalSessions
+	// rejects every inbound OPEN, a zero AcceptBacklog makes an unbuffered accept
+	// channel) even though session.New defaults the stream params — a silent
+	// footgun.
+	sp := cfg.SessionParams.WithDefaults()
+	n.sessParams = sp
+	n.sessions = make(map[session.SessionID]*liveSession)
+	n.sessByPeer = make(map[identity.NodeID]map[session.SessionID]struct{})
+	n.sessEpoch = make(map[identity.NodeID]uint64)
+	n.accept = make(chan *Session, sp.AcceptBacklog)
+	n.sessIn = make(chan sessInbound, 256)
+	n.sessCtl = make(chan sessCtlReq, 64)
+	n.sessTick = make(chan struct{}, 8)
+	n.manualSessionTick = cfg.ManualSessionTick
+	n.sessionTickInterval = cfg.SessionTickInterval
+	if n.sessionTickInterval == 0 {
+		n.sessionTickInterval = 25 * time.Millisecond
 	}
 
 	var persist func(uint64) error
@@ -336,6 +397,7 @@ func (n *Node) EnforceAllowList() bool { return n.enforce }
 
 // Run starts the node and blocks until ctx is canceled.
 func (n *Node) Run(ctx context.Context) error {
+	n.runCtx = ctx
 	// UDP read loop.
 	n.wg.Add(1)
 	go n.readLoop(ctx)
@@ -384,6 +446,12 @@ func (n *Node) Run(ctx context.Context) error {
 	if !n.manualPhases {
 		n.wg.Add(1)
 		go n.runPhases(ctx)
+	}
+
+	// Session RTO/fill/grace/persist driver (production only; tests inject ticks).
+	if !n.manualSessionTick {
+		n.wg.Add(1)
+		go n.runSessionTicks(ctx)
 	}
 
 	n.loop(ctx)
@@ -490,8 +558,8 @@ func (n *Node) loop(ctx context.Context) {
 		case u := <-n.lastSeen:
 			n.handleLastSeen(u)
 			n.sbDone()
-		case addr := <-n.done:
-			n.handleDone(addr)
+		case d := <-n.done:
+			n.handleDone(d)
 			n.sbDone()
 		case fd := <-n.forceDial:
 			n.handleForceDial(ctx, fd)
@@ -509,15 +577,48 @@ func (n *Node) loop(ctx context.Context) {
 			n.handleLeave()
 			close(reply)
 			n.sbDone()
+		case in := <-n.sessIn:
+			n.handleSessIn(in)
+			n.sbDone()
+		case req := <-n.sessCtl:
+			n.handleSessCtl(req)
+			n.sbDone()
+		case <-n.sessTick:
+			n.handleSessTick()
+			n.sbDone()
 		}
 	}
+}
+
+// packetConn returns the currently-bound PacketConn (roam-swappable).
+func (n *Node) packetConn() transport.PacketConn {
+	n.connMu.Lock()
+	defer n.connMu.Unlock()
+	return n.conn
+}
+
+// RebindConnForTest swaps the node's bound PacketConn to a new one (simulating a
+// roam / socket rebind) while keeping the SAME *Node and its entire session
+// registry. The old conn is closed, which unblocks and retires the old read loop;
+// a fresh read loop is started on the new conn. Test-only.
+func (n *Node) RebindConnForTest(c transport.PacketConn) {
+	n.connMu.Lock()
+	old := n.conn
+	n.conn = c
+	n.connMu.Unlock()
+	if old != nil {
+		_ = old.Close()
+	}
+	n.wg.Add(1)
+	go n.readLoop(n.runCtx)
 }
 
 func (n *Node) readLoop(ctx context.Context) {
 	defer n.wg.Done()
 	buf := make([]byte, transport.MaxFrame)
 	for {
-		nb, addr, err := n.conn.ReadFrom(buf)
+		conn := n.packetConn()
+		nb, addr, err := conn.ReadFrom(buf)
 		if err != nil {
 			return
 		}
@@ -708,22 +809,22 @@ func (n *Node) handleLastSeen(u lsUpdate) {
 	}
 }
 
-func (n *Node) handleDone(addr netip.AddrPort) {
+func (n *Node) handleDone(d doneMsg) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	p := n.byAddr[addr]
-	if p == nil {
+	p := n.byAddr[d.addr]
+	if p == nil || p != d.p {
+		// A newer session already replaced this address (or it was evicted);
+		// its own teardown owns these keys. Do not clobber it.
 		return
 	}
-	// Only remove if this peer never reached a stable connected identity, or
-	// drop both keys otherwise.
 	if !p.nodeID.IsZero() {
 		if n.byID[p.nodeID] == p {
 			delete(n.byID, p.nodeID)
 		}
 	}
-	delete(n.byAddr, addr)
-	n.half.Remove(addr)
+	delete(n.byAddr, d.addr)
+	n.half.Remove(d.addr)
 }
 
 // --- peer creation ----------------------------------------------------------
@@ -813,8 +914,8 @@ func (n *Node) startResponder(ctx context.Context, addr netip.AddrPort) *peer {
 
 func (n *Node) driveInitiator(ctx context.Context, p *peer) {
 	defer n.wg.Done()
-	defer n.notifyDone(ctx, p.addr)
-	snd := transport.AddrSender{Conn: n.conn, Addr: p.addr}
+	defer n.notifyDone(ctx, p)
+	snd := transport.AddrSender{Conn: n.packetConn(), Addr: p.addr}
 	res, err := transport.DoInitiator(ctx, n.clk, snd, p.inbox, n.self, n.psk, p.localIndex)
 	if err != nil {
 		return
@@ -828,8 +929,8 @@ func (n *Node) driveInitiator(ctx context.Context, p *peer) {
 
 func (n *Node) driveResponder(ctx context.Context, p *peer) {
 	defer n.wg.Done()
-	defer n.notifyDone(ctx, p.addr)
-	snd := transport.AddrSender{Conn: n.conn, Addr: p.addr}
+	defer n.notifyDone(ctx, p)
+	snd := transport.AddrSender{Conn: n.packetConn(), Addr: p.addr}
 	res, err := transport.DoResponder(ctx, n.clk, snd, p.inbox, n.self, n.psk, p.localIndex)
 	if err != nil {
 		return
@@ -938,7 +1039,7 @@ func (n *Node) sealSend(addr netip.AddrPort, sess *transport.Session, msg []byte
 	if err != nil {
 		return false
 	}
-	return n.conn.WriteTo(frame, addr) == nil
+	return n.packetConn().WriteTo(frame, addr) == nil
 }
 
 func (n *Node) handleApp(ctx context.Context, addr netip.AddrPort, fromID identity.NodeID, pt []byte) {
@@ -953,6 +1054,19 @@ func (n *Node) handleApp(ctx context.Context, addr netip.AddrPort, fromID identi
 		n.sbAdd()
 		select {
 		case n.swimIn <- swimInbound{fromID: fromID, fromAddr: addr, body: body}:
+		case <-ctx.Done():
+			n.sbDone()
+		}
+		return
+	}
+	if m.typ == msgSession {
+		// Route the session sub-frame to the loop, tagged with the authenticated
+		// peer identity (the resume/hijack guard keys off fromID). Copy the body
+		// so we never retain a sub-slice of the decrypt buffer.
+		body := append([]byte(nil), m.body...)
+		n.sbAdd()
+		select {
+		case n.sessIn <- sessInbound{fromID: fromID, fromAddr: addr, body: body}:
 		case <-ctx.Done():
 			n.sbDone()
 		}
@@ -989,10 +1103,10 @@ func (n *Node) requestAuth(ctx context.Context, addr netip.AddrPort, res *transp
 	}
 }
 
-func (n *Node) notifyDone(ctx context.Context, addr netip.AddrPort) {
+func (n *Node) notifyDone(ctx context.Context, p *peer) {
 	n.sbAdd()
 	select {
-	case n.done <- addr:
+	case n.done <- doneMsg{addr: p.addr, p: p}:
 	case <-ctx.Done():
 		n.sbDone()
 	}

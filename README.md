@@ -12,7 +12,7 @@
 
 DMesh (*"dou mesh"* — the French pronunciation of *D*) is a resilient, serverless peer-to-peer overlay mesh written in Go. Nodes find each other and connect directly — with **no central coordination server, nothing to host, and nothing to knock out** — and, unlike other meshes, the **sessions themselves survive** roaming, drops, and reconnects (Mosh's resilience, generalized to a whole mesh).
 
-> ⚠️ **Status: pre-alpha.** v0.1 shipped the foundation (credentialed mDNS discovery + an encrypted, mutually-authenticated Noise transport). **v0.2 adds SWIM gossip membership + failure detection**: the mesh now maintains a *replicated, gossiped roster* of who is a member and their liveness (alive / suspect / dead / left), detects failures with no coordinator, and learns peers transitively via gossip beyond direct mDNS. The remaining hero features — NAT traversal/relay, durable/resumable sessions, the topology dashboard — are later milestones.
+> ⚠️ **Status: pre-alpha.** v0.1 shipped the foundation (credentialed mDNS discovery + an encrypted, mutually-authenticated Noise transport). **v0.2 added SWIM gossip membership + failure detection**: the mesh maintains a *replicated, gossiped roster* of who is a member and their liveness (alive / suspect / dead / left), detects failures with no coordinator, and learns peers transitively via gossip beyond direct mDNS. **v0.3 ships the hero feature — durable / resumable sessions**: a reliable, ordered byte-stream anchored to peer *identity* rather than network endpoint, so a transfer pauses on a mid-stream drop and resumes byte-exact after the link heals or the node roams from one network to another (wifi to cellular), with no bytes lost, duplicated, or reordered. The remaining hero features — NAT traversal/relay, the topology dashboard, virtual-interface (TUN) mode — are later milestones.
 
 ## Why DMesh?
 
@@ -61,6 +61,40 @@ v0.2 defends failure detection and *transient* suspicion of **honest** members i
 
 v0.2 does **not** defend against a credentialed-but-**malicious** member forging membership. Because an update carries `(nodeID, incarnation, state)` with **no per-field authorship binding**, any credentialed member can author any fact about any node — win an incarnation war against a victim at every node that has no direct session to it, keep a dead node "alive", or inject a fabricated member (bounded by the allow-list when enforced). The real fix — **per-update Ed25519 signatures over `(nodeID, incarnation, epoch, state)`** so only a node authors its own state — is deferred to the signed-invite / CA milestone (the `epoch` byte is already reserved on the wire). The present-day mitigations are the allow-list (bounds *who* can inject) and handshake-as-ground-truth (protects a victim's directly-connected neighborhood). Note the transport replay window does **not** stop membership replay — incarnation monotonicity (the lattice + tombstones) is the sole membership anti-replay.
 
+## What v0.3 adds — durable sessions
+
+- **A reliable stream over best-effort datagrams.** The session layer lays a reliable, ordered, flow-controlled byte-stream over the best-effort encrypted Noise datagrams: cumulative ACK, Karn/Jacobson RTO estimation, out-of-order reassembly, and fixed send/receive windows. Each DATA frame is one datagram with no fragmentation — `MaxChunk` is 1156 bytes (the transport's max plaintext minus the session+data header).
+- **Keyed by identity, not endpoint — so sessions survive a roam.** A session is anchored to the peer's *authenticated identity*, never to a network address. A mid-stream drop **pauses** the stream rather than failing it — the pause is stall-driven, because a silent blackhole produces no close to react to — and when connectivity returns the stream **resumes byte-exact** from the cumulative-acked offset. A link blip that heals on the surviving Noise epoch recovers by plain same-epoch RTO retransmit; a roam to a different endpoint/network re-handshakes onto a **new epoch** and reconciles with a RESUME exchange. Either way no bytes are lost, duplicated, or reordered.
+- **Graceful half-close with a bounded TIME-WAIT.** Each direction half-closes with a FIN; once both directions are drained the session enters a short, bounded TIME-WAIT (a dedicated `Linger`, default 5s, clamped to `Grace`) that frees the send/receive buffers immediately and releases the session slot after the linger. Completed transfers therefore do not leak against the bounded session caps (`MaxTotalSessions` / `MaxSessionsPerPeer`).
+- **Bounded memory + roster-driven teardown.** The send buffer is capped by the send window and the receive buffer by the receive window plus an out-of-order segment cap, all freed on close or teardown. A paused session is torn down early (`ErrPeerGone`) the moment SWIM marks the peer `dead`/`left`, and an unrecovered pause expires on the grace timeout (`ErrGraceTimeout`) rather than lingering forever.
+- **Identity-guarded.** A frame is applied to a session only if it arrived on a transport authenticated as that session's peer, checked before any state mutation — so a third credentialed member cannot hijack or reset someone else's session.
+- **Runs over the existing Noise transport.** Session sub-frames are carried inside the v0.1 AEAD data frames under app type `0x20` (SWIM is `0x10`), so **all session traffic rides the authenticated, permissioned channels** — only credentialed peers can open or feed a session.
+
+```sh
+# receiver: accept one inbound session and write the file into DIR
+dmesh recv --out ./downloads
+
+# sender: open a durable session to a node ID and stream a file over it
+dmesh send <node-id> ./bigfile.iso
+
+# force a mid-stream pause/resume on a single machine (rebinds the local socket
+# to a fresh endpoint, exercising the real roam/resume path)
+dmesh send <node-id> ./bigfile.iso --chaos
+```
+
+Both ends print the SHA-256 of the bytes they moved on completion, so a human can
+confirm the transfer is identical across the pause/resume. `send` and `recv` share
+the usual node flags (`--label`, `--port`, `--no-mdns`).
+
+> **Honest scope of "resume":** resume is bounded by a session's lifetime, not
+> unlimited. A pause is retained only for `Grace` (default 30s) awaiting re-attach;
+> past that it is torn down with `ErrGraceTimeout`, and a SWIM `dead`/`left` tears a
+> paused session down sooner (`ErrPeerGone`). Off-LAN reconnection still depends on
+> reaching the peer's endpoint — NAT traversal / relay is the next milestone — so
+> today's resume covers link blips and roaming between reachable networks. The stream
+> ships correct reliability + flow control with a fixed send window and RTO-only loss
+> recovery; congestion control and SACK are deferred throughput refinements.
+
 ## Build
 
 ```sh
@@ -102,7 +136,7 @@ gossip. `dmesh members` prints that roster once and exits.
 
 ## Roadmap
 
-Done: gossip membership (SWIM, v0.2). Later milestones, in order: NAT traversal / relay (off-LAN data reachability) → **durable/resumable sessions** (the hero feature) → topology dashboard → virtual-interface (TUN) mode. Membership hardening — per-update signatures (forged-membership defense), signed invites / a tiny CA (Sybil/eclipse) — rides the signed-invite milestone.
+Done: gossip membership (SWIM, v0.2); **durable/resumable sessions** (the hero feature, v0.3). Later milestones, in order: NAT traversal / relay (off-LAN data reachability) → topology dashboard → virtual-interface (TUN) mode. Membership hardening — per-update signatures (forged-membership defense), signed invites / a tiny CA (Sybil/eclipse) — rides the signed-invite milestone.
 
 ## License
 
