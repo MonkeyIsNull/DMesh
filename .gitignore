@@ -26,3 +26,6 @@ go.work.sum
 .vscode/
 *.swp
 *.bak
+
+# Local design notes (kept out of the repo; retained locally + in history)
+BRAINSTORM.md

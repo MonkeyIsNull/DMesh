@@ -1,10 +1,18 @@
 # DMesh
 
+[![CI](https://github.com/MonkeyIsNull/DMesh/actions/workflows/ci.yml/badge.svg)](https://github.com/MonkeyIsNull/DMesh/actions/workflows/ci.yml)
+[![release](https://img.shields.io/github/v/release/MonkeyIsNull/DMesh)](https://github.com/MonkeyIsNull/DMesh/releases/latest)
+![Go version](https://img.shields.io/github/go-mod/go-version/MonkeyIsNull/DMesh)
+![platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)
+![serverless](https://img.shields.io/badge/serverless-yes-brightgreen)
+![status](https://img.shields.io/badge/status-pre--alpha-orange)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 **A serverless mesh where your sessions don't die.**
 
 DMesh (*"dou mesh"* — the French pronunciation of *D*) is a resilient, serverless peer-to-peer overlay mesh written in Go. Nodes find each other and connect directly — with **no central coordination server, nothing to host, and nothing to knock out** — and, unlike other meshes, the **sessions themselves survive** roaming, drops, and reconnects (Mosh's resilience, generalized to a whole mesh).
 
-> ⚠️ **Status: pre-alpha.** v0.1 ships the **foundation only**: two credentialed nodes on a LAN discover each other over mDNS and exchange encrypted, mutually-authenticated messages with zero config, while an uncredentialed peer is rejected. The hero features — durable/resumable sessions, gossip membership, NAT traversal/relay, the topology dashboard — are later milestones (see [BRAINSTORM.md](BRAINSTORM.md)).
+> ⚠️ **Status: pre-alpha.** v0.1 ships the **foundation only**: two credentialed nodes on a LAN discover each other over mDNS and exchange encrypted, mutually-authenticated messages with zero config, while an uncredentialed peer is rejected. The hero features — durable/resumable sessions, gossip membership, NAT traversal/relay, the topology dashboard — are later milestones.
 
 ## Why DMesh?
 
@@ -68,9 +76,9 @@ fingerprint, then a table of known peers (ID, label, endpoint, link state, last-
 > mDNS. CI and the offline test suite never touch multicast; the real-mDNS path is
 > only exercised under `DMESH_MDNS_E2E=1`.
 
-## Design
+## Roadmap
 
-See [BRAINSTORM.md](BRAINSTORM.md) for the evolving architecture — identity-not-address, gossip membership, Noise-encrypted transport, permissioned membership, resumable sessions, and DoS resistance.
+Later milestones, in order: gossip membership (SWIM) → NAT traversal / relay → **durable/resumable sessions** (the hero feature) → topology dashboard → virtual-interface (TUN) mode.
 
 ## License
 
