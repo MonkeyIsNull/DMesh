@@ -2,6 +2,7 @@
 //
 //	dmesh id                      print this node's ID (generating on first run)
 //	dmesh up [flags]              run the node: discover, connect, status view
+//	dmesh members                 print the gossiped membership roster once
 //	dmesh network-key gen|set|show|clear
 //	dmesh trust <id> [label] | trust list | untrust <id>
 package main
@@ -41,6 +42,8 @@ func main() {
 		err = cmdID(os.Args[2:])
 	case "up":
 		err = cmdUp(os.Args[2:])
+	case "members":
+		err = cmdMembers(os.Args[2:])
 	case "network-key":
 		err = cmdNetworkKey(os.Args[2:])
 	case "trust":
@@ -62,11 +65,12 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `dmesh - a serverless mesh where your sessions don't die (v0.1)
+	fmt.Fprint(os.Stderr, `dmesh - a serverless mesh where your sessions don't die (v0.2)
 
 usage:
   dmesh id
   dmesh up [--label NAME] [--port N] [--no-mdns] [--trust-only]
+  dmesh members [--label NAME] [--port N] [--no-mdns] [--for SECS]
   dmesh network-key gen|set|show|clear
   dmesh trust <node-id> [label]
   dmesh trust list
@@ -166,25 +170,37 @@ func cmdUp(args []string) error {
 		Clock:            clock.Real{},
 		EnforceAllowList: enforce,
 		SendGreeting:     true,
+		IncarnationPath:  c.IncarnationPath(),
 	})
 	if err != nil {
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	// The run context is cancelled only AFTER a graceful Leave has been flushed,
+	// so SIGTERM/Ctrl-C announces a 'left' membership update to peers (suppressing
+	// a failure cascade) before the loop exits.
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
 
 	errCh := make(chan error, 1)
-	go func() { errCh <- n.Run(ctx) }()
+	go func() { errCh <- n.Run(runCtx) }()
 
 	printHeader(n, psk)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
 		select {
-		case <-ctx.Done():
+		case <-sigCh:
+			fmt.Println("\nleaving the mesh gracefully...")
+			leaveCtx, cancel := context.WithTimeout(runCtx, 2*time.Second)
+			n.Leave(leaveCtx)
+			cancel()
+			runCancel()
 			<-errCh
-			fmt.Println("\nshutting down.")
+			fmt.Println("shutting down.")
 			return nil
 		case err := <-errCh:
 			return err
@@ -192,6 +208,70 @@ func cmdUp(args []string) error {
 			renderStatus(n)
 		}
 	}
+}
+
+// cmdMembers runs a node briefly and prints the gossiped roster once, then
+// exits. Useful for scripting / a one-shot view.
+func cmdMembers(args []string) error {
+	fs := flag.NewFlagSet("members", flag.ExitOnError)
+	label := fs.String("label", "", "human label for this node")
+	port := fs.Int("port", 0, "UDP port to listen on (0 = ephemeral)")
+	noMDNS := fs.Bool("no-mdns", false, "disable mDNS discovery")
+	forSecs := fs.Int("for", 5, "seconds to gossip before printing the roster")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	c, err := openConfig()
+	if err != nil {
+		return err
+	}
+	id, _, err := c.LoadIdentity(*label)
+	if err != nil {
+		return err
+	}
+	psk, err := c.LoadNetworkKey()
+	if err != nil {
+		return err
+	}
+	if len(psk) == 0 {
+		return errors.New("no network key configured; run 'dmesh network-key gen' (fail closed)")
+	}
+	trusted, err := loadTrustedSet(c)
+	if err != nil {
+		return err
+	}
+	conn, err := transport.ListenUDP(*port)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	var disc discovery.Discovery
+	if !*noMDNS {
+		disc = discovery.NewMDNS()
+		defer disc.Close()
+	}
+	n, err := node.New(node.Config{
+		Identity:         id,
+		NetworkPSK:       psk,
+		Policy:           transport.AllowList(trusted, false),
+		Discovery:        disc,
+		Conn:             conn,
+		Clock:            clock.Real{},
+		EnforceAllowList: len(trusted) > 0,
+		IncarnationPath:  c.IncarnationPath(),
+	})
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(*forSecs)*time.Second)
+	defer cancel()
+	errCh := make(chan error, 1)
+	go func() { errCh <- n.Run(ctx) }()
+	<-ctx.Done()
+	renderStatus(n)
+	cancel()
+	<-errCh
+	return nil
 }
 
 func printHeader(n *node.Node, psk []byte) {
@@ -207,28 +287,56 @@ func printHeader(n *node.Node, psk []byte) {
 	fmt.Printf("  (Ctrl-C to quit)\n\n")
 }
 
-// renderStatus redraws the peer table.
+// renderStatus redraws the FULL gossiped membership roster (every member the
+// mesh knows of, not just directly-discovered peers), with per-member state,
+// incarnation, endpoint hint, direct-link status, and last change.
 func renderStatus(n *node.Node) {
-	peers := n.Snapshot()
-	sort.Slice(peers, func(i, j int) bool { return peers[i].Endpoint.String() < peers[j].Endpoint.String() })
+	rows := n.RosterSnapshot()
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].IsSelf != rows[j].IsSelf {
+			return rows[i].IsSelf // self first
+		}
+		return rows[i].NodeID.String() < rows[j].NodeID.String()
+	})
+
+	members := 0
+	for _, r := range rows {
+		if !r.IsSelf {
+			members++
+		}
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "\033[H\033[2J") // clear screen + home
-	fmt.Fprintf(&b, "DMesh %s (%s)   peers: %d\n\n", n.SelfID().Short(), orNone(n.SelfLabel()), len(peers))
-	fmt.Fprintf(&b, "%-12s  %-16s  %-22s  %-12s  %s\n", "ID", "LABEL", "ENDPOINT", "STATE", "LAST-SEEN")
-	fmt.Fprintf(&b, "%s\n", strings.Repeat("-", 78))
+	fmt.Fprintf(&b, "DMesh %s (%s)   members: %d\n\n", n.SelfID().Short(), orNone(n.SelfLabel()), members)
+	fmt.Fprintf(&b, "%-12s  %-14s  %-8s  %-6s  %-22s  %-6s  %s\n",
+		"ID", "LABEL", "STATE", "INC", "ENDPOINT", "LINK", "LAST-CHANGE")
+	fmt.Fprintf(&b, "%s\n", strings.Repeat("-", 92))
 	now := time.Now()
-	for _, p := range peers {
-		idCol := "(unknown)"
-		if p.HasID {
-			idCol = p.NodeID.Short()
+	for _, r := range rows {
+		idCol := r.NodeID.Short()
+		label := truncate(r.Label, 14)
+		link := "-"
+		if r.Linked {
+			link = "conn"
+		}
+		state := r.State
+		if r.IsSelf {
+			state = "self"
+			link = "-"
+		}
+		endpoint := "-"
+		if r.Endpoint.IsValid() {
+			endpoint = r.Endpoint.String()
 		}
 		last := "-"
-		if !p.LastSeen.IsZero() {
-			last = fmt.Sprintf("%ds ago", int(now.Sub(p.LastSeen).Seconds()))
+		if r.IsSelf {
+			last = "-"
+		} else if !r.StateChange.IsZero() {
+			last = fmt.Sprintf("%ds ago", int(now.Sub(r.StateChange).Seconds()))
 		}
-		fmt.Fprintf(&b, "%-12s  %-16s  %-22s  %-12s  %s\n",
-			idCol, truncate(p.Label, 16), p.Endpoint.String(), p.State.String(), last)
+		fmt.Fprintf(&b, "%-12s  %-14s  %-8s  %-6d  %-22s  %-6s  %s\n",
+			idCol, label, state, r.Incarnation, endpoint, link, last)
 	}
 	fmt.Print(b.String())
 }

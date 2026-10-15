@@ -83,6 +83,22 @@ func waitConnected(t *testing.T, n *Node, peer identity.NodeID, timeout time.Dur
 	return false
 }
 
+// waitLabel polls until the node has learned the given label for peer (sent via
+// HELLO just after connect), or the timeout elapses.
+func waitLabel(t *testing.T, n *Node, peer identity.NodeID, want string, timeout time.Duration) bool {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, p := range n.Snapshot() {
+			if p.NodeID == peer && p.Label == want {
+				return true
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return false
+}
+
 func countConnected(n *Node, peer identity.NodeID) int {
 	c := 0
 	for _, p := range n.Snapshot() {
@@ -123,14 +139,11 @@ func TestTwoNodesConnectOverLoopback(t *testing.T) {
 	if c := countConnected(b.n, a.id.NodeID()); c != 1 {
 		t.Errorf("B has %d connected sessions to A, want 1", c)
 	}
-	// Labels were exchanged via HELLO.
-	gotLabel := false
-	for _, p := range a.n.Snapshot() {
-		if p.NodeID == b.id.NodeID() && p.Label == "bob" {
-			gotLabel = true
-		}
-	}
-	if !gotLabel {
+	// Labels were exchanged via HELLO. The HELLO frame is sent just AFTER the
+	// handshake completes, so reaching Connected does not guarantee it has been
+	// processed yet; poll for it rather than reading once (the single-read race
+	// was an intermittent full-package -race failure).
+	if !waitLabel(t, a.n, b.id.NodeID(), "bob", 5*time.Second) {
 		t.Error("A did not learn B's label via HELLO")
 	}
 

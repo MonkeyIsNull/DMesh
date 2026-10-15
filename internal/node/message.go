@@ -9,7 +9,17 @@ const (
 	msgKeepalive = 2
 	msgPing      = 3
 	msgText      = 4
+
+	// msgSwim carries a SWIM membership envelope (see internal/swim/codec.go).
+	// The range 0x10..0x1F is reserved for membership so future SWIM sub-types
+	// never collide with the v0.1 app messages (1..4).
+	msgSwim = 0x10
 )
+
+// encodeSwim wraps an encoded SWIM envelope body in the msgSwim app type.
+func encodeSwim(body []byte) []byte {
+	return append([]byte{msgSwim}, body...)
+}
 
 // encodeHello builds a HELLO carrying this node's label. The node ID is already
 // authenticated by the handshake, so it is not repeated here.
