@@ -12,7 +12,7 @@
 
 DMesh (*"dou mesh"* — the French pronunciation of *D*) is a resilient, serverless peer-to-peer overlay mesh written in Go. Nodes find each other and connect directly — with **no central coordination server, nothing to host, and nothing to knock out** — and, unlike other meshes, the **sessions themselves survive** roaming, drops, and reconnects (Mosh's resilience, generalized to a whole mesh).
 
-> ⚠️ **Status: pre-alpha.** v0.1 ships the **foundation only**: two credentialed nodes on a LAN discover each other over mDNS and exchange encrypted, mutually-authenticated messages with zero config, while an uncredentialed peer is rejected. The hero features — durable/resumable sessions, gossip membership, NAT traversal/relay, the topology dashboard — are later milestones.
+> ⚠️ **Status: pre-alpha.** v0.1 shipped the foundation (credentialed mDNS discovery + an encrypted, mutually-authenticated Noise transport). **v0.2 adds SWIM gossip membership + failure detection**: the mesh now maintains a *replicated, gossiped roster* of who is a member and their liveness (alive / suspect / dead / left), detects failures with no coordinator, and learns peers transitively via gossip beyond direct mDNS. The remaining hero features — NAT traversal/relay, durable/resumable sessions, the topology dashboard — are later milestones.
 
 ## Why DMesh?
 
@@ -38,6 +38,28 @@ DMesh (*"dou mesh"* — the French pronunciation of *D*) is a resilient, serverl
 - **Permissioned membership (fail-closed)** — a mandatory 32-byte **pre-shared network key** is mixed as the Noise PSK (`psk0`): a wrong or absent key fails the handshake at message 1. There is **no keyless fallback** — `dmesh up` refuses to start without a key. An optional **allow-list** of trusted node IDs is checked *after* the handshake, against the cryptographically-authenticated identity (never the spoofable mDNS TXT record).
 
 > **Honest scope of "permissioned":** with an empty allow-list, v0.1 is **trust-on-first-use** — anyone holding the network key is admitted (the intended shared-secret model). Per-node control exists only when you populate the allow-list (or pass `--trust-only`). Full signed invites / a tiny CA are a later milestone.
+
+## What v0.2 adds — SWIM membership
+
+- **A replicated roster, not just a peer list.** Each node keeps a membership table keyed by node ID with a state (`alive` / `suspect` / `dead` / `left`), a monotonic **incarnation**, an endpoint hint, and a last-change time. A node that leaves or fails is **marked, not forgotten** — dead/left entries are retained a while (then reaped behind a bounded tombstone) so a return reconciles. `dmesh up` now shows this **full gossiped roster**, including peers it learned only via gossip and never discovered directly.
+- **Coordinator-free failure detection (SWIM + Lifeguard).** Each 1s protocol period a node direct-pings one target (round-robin over a shuffled member list); on no ack within `T/3` it asks `K=3` random members to **indirect-ping** (ping-req) it; still no ack by period end marks it **suspect**. A suspect becomes **dead** after a log-scaled suspicion timeout unless it refutes.
+- **Incarnation numbers + refutation.** Membership facts are a total-order lattice over `(incarnation, state-precedence)` — higher incarnation wins; at a tie, `left > dead > suspect > alive`. A node **refutes** a suspicion about itself by bumping its incarnation and broadcasting `alive`. The self-incarnation is **persisted beside the identity** and resumed at `persisted+1`, so a **restarted** node (even one a peer already reaped) deterministically out-runs any stale state about it.
+- **Bounded, infection-style gossip.** Membership updates piggyback on ping/ack/ping-req frames (no standalone gossip packets in steady state), each retransmitted ~`O(log N)` times then retired, capped per datagram to stay under the UDP MTU. A completed handshake triggers a bounded bidirectional **join-sync** that both seeds a new node and lets a stale node learn it must refute — this is the connectivity-triggered reconciliation that stands in for periodic anti-entropy.
+- **Runs over the existing Noise transport.** SWIM messages are a small, versioned, length-checked format carried inside the v0.1 AEAD data frames (app type `0x10`), so **all membership traffic rides the authenticated, permissioned channels** — only credentialed peers gossip.
+
+```sh
+dmesh members          # run briefly, print the gossiped roster once, exit
+dmesh up               # the live status view now shows the full roster
+# Ctrl-C / SIGTERM announces a graceful "left" to peers before exiting
+```
+
+> **"Alive" for a peer you can't reach.** Gossip may tell node A about peer C that A cannot directly reach (NAT / off-LAN). A **never probes, and therefore never suspects, a member it has no live session to** — its view of C is purely gossip-driven, kept alive as long as *some* member can reach C. A suspicion is cleared only by C's own higher-incarnation refutation carried back over a connected path, never by "someone says C is alive." Actual off-LAN *data* reachability (hole-punching / relay) is the next milestone; v0.2 only guarantees C is not falsely declared dead while others can reach it.
+
+### Security scope of v0.2 membership (read this)
+
+v0.2 defends failure detection and *transient* suspicion of **honest** members inside a credentialed mesh: gossip is bounded (no amplification), indirect probing is identity-only (no reflection / dial-storm), and self-incarnation inflation is capped (`Suspect{self, HUGE}` is provably forged and dropped, since only a node advances its own incarnation).
+
+v0.2 does **not** defend against a credentialed-but-**malicious** member forging membership. Because an update carries `(nodeID, incarnation, state)` with **no per-field authorship binding**, any credentialed member can author any fact about any node — win an incarnation war against a victim at every node that has no direct session to it, keep a dead node "alive", or inject a fabricated member (bounded by the allow-list when enforced). The real fix — **per-update Ed25519 signatures over `(nodeID, incarnation, epoch, state)`** so only a node authors its own state — is deferred to the signed-invite / CA milestone (the `epoch` byte is already reserved on the wire). The present-day mitigations are the allow-list (bounds *who* can inject) and handshake-as-ground-truth (protects a victim's directly-connected neighborhood). Note the transport replay window does **not** stop membership replay — incarnation monotonicity (the lattice + tombstones) is the sole membership anti-replay.
 
 ## Build
 
@@ -70,7 +92,9 @@ dmesh up --trust-only            # admit only allow-listed peers
 ```
 
 `dmesh up` prints a live status view: this node's ID/label/endpoint and network-key
-fingerprint, then a table of known peers (ID, label, endpoint, link state, last-seen).
+fingerprint, then the **full gossiped membership roster** (ID, label, state, incarnation,
+endpoint hint, direct-link status, last change) — including members learned only via
+gossip. `dmesh members` prints that roster once and exits.
 
 > **macOS note:** the first LAN run may raise a *Local Network* permission prompt for
 > mDNS. CI and the offline test suite never touch multicast; the real-mDNS path is
@@ -78,7 +102,7 @@ fingerprint, then a table of known peers (ID, label, endpoint, link state, last-
 
 ## Roadmap
 
-Later milestones, in order: gossip membership (SWIM) → NAT traversal / relay → **durable/resumable sessions** (the hero feature) → topology dashboard → virtual-interface (TUN) mode.
+Done: gossip membership (SWIM, v0.2). Later milestones, in order: NAT traversal / relay (off-LAN data reachability) → **durable/resumable sessions** (the hero feature) → topology dashboard → virtual-interface (TUN) mode. Membership hardening — per-update signatures (forged-membership defense), signed invites / a tiny CA (Sybil/eclipse) — rides the signed-invite milestone.
 
 ## License
 

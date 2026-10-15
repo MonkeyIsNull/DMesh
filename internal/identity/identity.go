@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -118,11 +119,22 @@ func ParseNodeID(s string) (NodeID, error) {
 
 // Generate creates a fresh identity from crypto/rand.
 func Generate(label string) (*Identity, error) {
-	_, sk, err := ed25519.GenerateKey(rand.Reader)
+	return GenerateFrom(label, rand.Reader)
+}
+
+// GenerateFrom creates an identity drawing all key material from the given
+// reader. Production always passes crypto/rand (via Generate); the DETERMINISTIC
+// test harness passes a seeded reader so a simulated mesh has reproducible node
+// IDs — essential because the roster, the probe round-robin, and the initiator
+// election all key off the node ID, so random IDs would make an otherwise
+// deterministic simulation diverge run-to-run. Never pass a low-entropy reader
+// in production.
+func GenerateFrom(label string, reader io.Reader) (*Identity, error) {
+	_, sk, err := ed25519.GenerateKey(reader)
 	if err != nil {
 		return nil, fmt.Errorf("identity: ed25519 keygen: %w", err)
 	}
-	dh, err := noise.DH25519.GenerateKeypair(rand.Reader)
+	dh, err := noise.DH25519.GenerateKeypair(reader)
 	if err != nil {
 		return nil, fmt.Errorf("identity: x25519 keygen: %w", err)
 	}

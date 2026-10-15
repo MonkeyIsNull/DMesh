@@ -21,10 +21,11 @@ import (
 )
 
 const (
-	dirName        = "dmesh"
-	identityFile   = "identity.json"
-	networkKeyFile = "network.key"
-	trustFile      = "trust.json"
+	dirName         = "dmesh"
+	identityFile    = "identity.json"
+	networkKeyFile  = "network.key"
+	trustFile       = "trust.json"
+	incarnationFile = "incarnation"
 
 	dirPerm  os.FileMode = 0o700
 	filePerm os.FileMode = 0o600
@@ -72,6 +73,11 @@ func (c *Config) Dir() string { return c.dir }
 
 // IdentityPath returns the path to the identity file.
 func (c *Config) IdentityPath() string { return filepath.Join(c.dir, identityFile) }
+
+// IncarnationPath returns the path to the persisted SWIM self-incarnation,
+// stored beside the identity (they live or die together, which is what makes
+// the restart/incarnation-reset fix sound).
+func (c *Config) IncarnationPath() string { return filepath.Join(c.dir, incarnationFile) }
 
 // LoadIdentity loads the node identity, generating and persisting one on first
 // run. The bool reports whether a new identity was created.

@@ -108,3 +108,10 @@ func (t *HalfOpenTable) Remove(addr netip.AddrPort) {
 	delete(t.items, addr)
 	t.mu.Unlock()
 }
+
+// Len returns the current number of half-open entries (for bounds assertions).
+func (t *HalfOpenTable) Len() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return len(t.items)
+}

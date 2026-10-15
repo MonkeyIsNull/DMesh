@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/MonkeyIsNull/DMesh/internal/identity"
+	"github.com/MonkeyIsNull/DMesh/internal/transport"
 )
 
 // LinkState is a peer's connection state for the status view.
@@ -62,6 +63,13 @@ type peer struct {
 
 	state    LinkState
 	lastSeen time.Time
+
+	// sess is the live transport session, published to the loop by the driver
+	// over sessReady once the handshake completes. The loop owns this field (so
+	// all peer-field writes stay single-writer) and Seals SWIM frames directly
+	// through it; Session.Seal is itself concurrency-safe, so the loop Sealing
+	// alongside the driver's keepalive/runSession is sound.
+	sess *transport.Session
 }
 
 // PeerView is an immutable snapshot of a peer for the status renderer.
