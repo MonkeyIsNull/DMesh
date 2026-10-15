@@ -14,7 +14,18 @@ const (
 	// The range 0x10..0x1F is reserved for membership so future SWIM sub-types
 	// never collide with the v0.1 app messages (1..4).
 	msgSwim = 0x10
+
+	// msgSession carries a durable-session sub-frame (see internal/session). The
+	// range 0x20..0x2F is reserved for the session layer; the body is a
+	// session.Encode'd frame (subtype + sessionID + fields).
+	msgSession = 0x20
 )
+
+// encodeSession wraps an encoded session sub-frame body in the msgSession app
+// type.
+func encodeSession(body []byte) []byte {
+	return append([]byte{msgSession}, body...)
+}
 
 // encodeSwim wraps an encoded SWIM envelope body in the msgSwim app type.
 func encodeSwim(body []byte) []byte {

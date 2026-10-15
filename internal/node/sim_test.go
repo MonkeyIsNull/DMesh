@@ -88,6 +88,8 @@ type router struct {
 	conns        map[netip.AddrPort]*simConn
 	rng          *rand.Rand
 	lossPermille int
+	dupPermille  int
+	dupSent      int // count of injected on-wire duplicates (instrumentation)
 	isolated     map[netip.AddrPort]bool
 	blocked      map[linkKey]bool
 
@@ -130,20 +132,32 @@ func (r *router) send(src, dst netip.AddrPort, data []byte) {
 		drop = true
 	}
 	dc := r.conns[dst]
+	// Duplicate a fraction of the DELIVERED packets so the receiver sees genuine
+	// on-wire duplicates (exercising the seq/offset dedup path), not only the
+	// go-back-N retransmits loss produces. The RNG is drawn under the lock so the
+	// sim stays bit-for-bit deterministic. Each copy is an independent delivery
+	// unit, so the barrier stays balanced.
+	copies := 1
+	if !drop && dc != nil && r.dupPermille > 0 && r.rng.Intn(1000) < r.dupPermille {
+		copies = 2
+		r.dupSent++
+	}
 	if drop || dc == nil {
 		r.mu.Unlock()
 		return // dropped: no delivery unit created
 	}
 	r.mu.Unlock()
-	// Count the delivery unit BEFORE the hand-off, so the consuming node's event
+	// Count each delivery unit BEFORE the hand-off, so the consuming node's event
 	// loop cannot retire it before it is counted. The unit is carried through
 	// conn.queue -> read loop -> n.inbound and retired by the loop after
 	// handleInbound.
-	r.b.add(1)
-	select {
-	case dc.queue <- simPkt{src: src, data: data}:
-	default:
-		r.b.done() // queue full: the packet is dropped, so retire its unit
+	for i := 0; i < copies; i++ {
+		r.b.add(1)
+		select {
+		case dc.queue <- simPkt{src: src, data: data}:
+		default:
+			r.b.done() // queue full: the packet is dropped, so retire its unit
+		}
 	}
 }
 
@@ -241,6 +255,21 @@ func (r *router) setLoss(permille int) {
 	r.mu.Lock()
 	r.lossPermille = permille
 	r.mu.Unlock()
+}
+
+// setDup makes the router deliver a `permille`/1000 fraction of its delivered
+// packets twice, injecting genuine on-wire duplicates.
+func (r *router) setDup(permille int) {
+	r.mu.Lock()
+	r.dupPermille = permille
+	r.mu.Unlock()
+}
+
+// dupSentCount returns how many on-wire duplicates the router has injected.
+func (r *router) dupSentCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.dupSent
 }
 
 func (r *router) isolate(addr netip.AddrPort, on bool) {
@@ -650,3 +679,47 @@ func (n *Node) memberCountForTest() int {
 
 // halfOpenLenForTest returns the current half-open table size.
 func (n *Node) halfOpenLenForTest() int { return n.half.Len() }
+
+// --- v0.3 session sim helpers ----------------------------------------------
+
+// dropTransport blocks the link both ways (a silent blackhole), as a WiFi-off /
+// mid-stream transport drop. The Noise session objects stay alive on both sides
+// (no read deadline), so this exercises the same-epoch pause/retransmit path.
+func (m *simMesh) dropTransport(a, b *simNode) { m.r.blockLink(a.addr, b.addr, true) }
+
+// healTransport unblocks a dropped link.
+func (m *simMesh) healTransport(a, b *simNode) { m.r.blockLink(a.addr, b.addr, false) }
+
+// rebindConn simulates a roam: the node keeps its *Node AND its entire session
+// registry, but its UDP socket moves to a new address. The old conn is closed
+// (its read loop exits), discovery is re-seeded so peers re-handshake to the new
+// address, and sn.addr is updated. Unlike restartNode (a fresh *Node with empty
+// session memory — the SWIM-dead case), this preserves durable sessions, which
+// is exactly the roam-resume path.
+func (m *simMesh) rebindConn(sn *simNode, newAddr netip.AddrPort) {
+	old := sn.addr
+	conn := m.r.register(newAddr)
+	sn.n.RebindConnForTest(conn)
+	m.r.unregister(old)
+	sn.conn = conn
+	sn.addr = newAddr
+}
+
+// sessTickAll injects one session tick into every node, settling after each so
+// each tick's full cascade (seals, deliveries, teardown, re-dial) completes
+// before the next node ticks — the same total-order discipline as period().
+func (m *simMesh) sessTickAll() {
+	for _, sn := range m.nodes {
+		sn.n.InjectSessionTick(m.ctx)
+		m.r.settle()
+	}
+}
+
+// sessPump advances the clock by d and injects a session tick round, k times.
+func (m *simMesh) sessPump(d time.Duration, k int) {
+	for i := 0; i < k; i++ {
+		m.clk.Advance(d)
+		m.r.settle()
+		m.sessTickAll()
+	}
+}

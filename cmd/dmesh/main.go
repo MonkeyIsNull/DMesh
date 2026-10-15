@@ -44,6 +44,10 @@ func main() {
 		err = cmdUp(os.Args[2:])
 	case "members":
 		err = cmdMembers(os.Args[2:])
+	case "send":
+		err = cmdSend(os.Args[2:])
+	case "recv":
+		err = cmdRecv(os.Args[2:])
 	case "network-key":
 		err = cmdNetworkKey(os.Args[2:])
 	case "trust":
@@ -71,6 +75,8 @@ usage:
   dmesh id
   dmesh up [--label NAME] [--port N] [--no-mdns] [--trust-only]
   dmesh members [--label NAME] [--port N] [--no-mdns] [--for SECS]
+  dmesh send <node-id> <file> [--chaos]
+  dmesh recv [--out DIR]
   dmesh network-key gen|set|show|clear
   dmesh trust <node-id> [label]
   dmesh trust list
