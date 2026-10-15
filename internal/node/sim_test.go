@@ -526,7 +526,11 @@ func (m *simMesh) stop() {
 
 // waitAllConnected polls until every node is connected to every other node (or
 // times out). Connection uses the node goroutines + immediate delivery, so a
-// poll (not the activity barrier) is the right tool here.
+// poll (not the activity barrier) is the right tool here. When a poll finds the
+// mesh not yet connected, it also advances the injected simulated clock so that
+// handshake RTO retransmit and fallback-dial timers (both driven by m.clk) can
+// fire; otherwise a dropped/reordered handshake frame would deadlock the
+// handshake on a frozen clock until the wall-clock deadline.
 func (m *simMesh) waitAllConnected(timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -534,7 +538,17 @@ func (m *simMesh) waitAllConnected(timeout time.Duration) bool {
 		if m.allConnected() {
 			return true
 		}
-		time.Sleep(10 * time.Millisecond)
+		// Not yet connected: a handshake frame was dropped/reordered (e.g. under
+		// -race scheduling) and recovery is a stopAndWait RTO retransmit (and/or
+		// the fallback dial), both on the INJECTED clock. Advance simulated time
+		// so those timers fire; without this the handshake deadlocks on a frozen
+		// clock until the wall-clock deadline (instant-or-never; Linux -race
+		// exposes it). 250ms == transport defaultRTO, so one step == one retransmit
+		// opportunity; reconnect completes in a few steps, well under any grace/
+		// suspicion threshold.
+		m.clk.Advance(250 * time.Millisecond)
+		m.r.settle()
+		time.Sleep(time.Millisecond)
 	}
 	return m.allConnected()
 }

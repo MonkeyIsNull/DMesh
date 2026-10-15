@@ -167,11 +167,18 @@ func TestSessionMidStreamDropResume(t *testing.T) {
 	}
 	payload := makePayload(24000, 7)
 
-	// Feed the whole payload; deliver part of it.
+	// Deliver a bounded PREFIX cleanly so the resumed session starts from a
+	// non-zero, below-total offset. Capping what we WRITE before the drop (rather
+	// than relying on how much a settle happens to drain) keeps "partial delivery"
+	// deterministic under -race: we never write past prefixBytes, so pre-drop
+	// delivery can never reach the full payload. The remaining payload is written
+	// AFTER the drop (below), which is what puts unacked data in flight and arms
+	// the stall detector.
+	const prefixBytes = 8000 // < len(payload); a few SendWindows (4096) wide
 	off := 0
-	for i := 0; i < 2; i++ {
-		for off < len(payload) {
-			acc := a.n.writeForTest(m.ctx, id, payload[off:])
+	for round := 0; round < 12 && len(b.n.deliveredForTest(id)) < prefixBytes; round++ {
+		for off < prefixBytes {
+			acc := a.n.writeForTest(m.ctx, id, payload[off:prefixBytes])
 			if acc == 0 {
 				break
 			}
@@ -555,12 +562,14 @@ func TestSessionNoHijack(t *testing.T) {
 	// anchored to A, so the identity guard (ls.peer != in.fromID) must drop every
 	// one of C's frames BEFORE any state mutation. Injecting into C's own node (as
 	// an earlier version did) exercised nothing: C owns no such session.
+	m.r.settle() // park B's loop so the baseline reads of loop-owned session state are race-free (quiescence precondition)
 	rcvBefore := b.n.rcvNxtForTest(id)
 	stateBefore := b.n.sessionStateForTest(id)
 	b.n.injectSessionFrameForTest(m.ctx, c.id.NodeID(), session.Frame{Sub: 3 /*subData*/, Session: id, Offset: 0, Data: []byte("HIJACK")})
 	b.n.injectSessionFrameForTest(m.ctx, c.id.NodeID(), session.ResetFrame(id, session.ResetClosed))
 	m.r.settle()
 	m.sessTickAll()
+	m.r.settle()
 
 	if b.n.sessionClosedForTest(id) {
 		t.Fatal("forged RESET from a third party tore the session down (hijack)")

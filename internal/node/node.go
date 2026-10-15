@@ -121,7 +121,7 @@ type Node struct {
 	hints     chan discovery.PeerHint
 	auth      chan *authReq
 	lastSeen  chan lsUpdate
-	done      chan netip.AddrPort
+	done      chan doneMsg
 	forceDial chan forceDialReq
 
 	// --- v0.2 SWIM state, owned exclusively by the loop goroutine ---
@@ -215,6 +215,14 @@ type sessReadyMsg struct {
 	sess *transport.Session
 }
 
+// doneMsg carries the identity of the session driver that exited, so the loop's
+// handleDone only retires the address keys if they still point at THAT peer and
+// not at a newer session that reused the same address.
+type doneMsg struct {
+	addr netip.AddrPort
+	p    *peer
+}
+
 type swimInbound struct {
 	fromID   identity.NodeID
 	fromAddr netip.AddrPort
@@ -300,7 +308,7 @@ func New(cfg Config) (*Node, error) {
 		hints:             make(chan discovery.PeerHint, 64),
 		auth:              make(chan *authReq, 16),
 		lastSeen:          make(chan lsUpdate, 256),
-		done:              make(chan netip.AddrPort, 64),
+		done:              make(chan doneMsg, 64),
 		forceDial:         make(chan forceDialReq, 64),
 		params:            params,
 		gossip:            swim.NewBuffer(gossipBufferCap(params)),
@@ -550,8 +558,8 @@ func (n *Node) loop(ctx context.Context) {
 		case u := <-n.lastSeen:
 			n.handleLastSeen(u)
 			n.sbDone()
-		case addr := <-n.done:
-			n.handleDone(addr)
+		case d := <-n.done:
+			n.handleDone(d)
 			n.sbDone()
 		case fd := <-n.forceDial:
 			n.handleForceDial(ctx, fd)
@@ -801,22 +809,22 @@ func (n *Node) handleLastSeen(u lsUpdate) {
 	}
 }
 
-func (n *Node) handleDone(addr netip.AddrPort) {
+func (n *Node) handleDone(d doneMsg) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
-	p := n.byAddr[addr]
-	if p == nil {
+	p := n.byAddr[d.addr]
+	if p == nil || p != d.p {
+		// A newer session already replaced this address (or it was evicted);
+		// its own teardown owns these keys. Do not clobber it.
 		return
 	}
-	// Only remove if this peer never reached a stable connected identity, or
-	// drop both keys otherwise.
 	if !p.nodeID.IsZero() {
 		if n.byID[p.nodeID] == p {
 			delete(n.byID, p.nodeID)
 		}
 	}
-	delete(n.byAddr, addr)
-	n.half.Remove(addr)
+	delete(n.byAddr, d.addr)
+	n.half.Remove(d.addr)
 }
 
 // --- peer creation ----------------------------------------------------------
@@ -906,7 +914,7 @@ func (n *Node) startResponder(ctx context.Context, addr netip.AddrPort) *peer {
 
 func (n *Node) driveInitiator(ctx context.Context, p *peer) {
 	defer n.wg.Done()
-	defer n.notifyDone(ctx, p.addr)
+	defer n.notifyDone(ctx, p)
 	snd := transport.AddrSender{Conn: n.packetConn(), Addr: p.addr}
 	res, err := transport.DoInitiator(ctx, n.clk, snd, p.inbox, n.self, n.psk, p.localIndex)
 	if err != nil {
@@ -921,7 +929,7 @@ func (n *Node) driveInitiator(ctx context.Context, p *peer) {
 
 func (n *Node) driveResponder(ctx context.Context, p *peer) {
 	defer n.wg.Done()
-	defer n.notifyDone(ctx, p.addr)
+	defer n.notifyDone(ctx, p)
 	snd := transport.AddrSender{Conn: n.packetConn(), Addr: p.addr}
 	res, err := transport.DoResponder(ctx, n.clk, snd, p.inbox, n.self, n.psk, p.localIndex)
 	if err != nil {
@@ -1095,10 +1103,10 @@ func (n *Node) requestAuth(ctx context.Context, addr netip.AddrPort, res *transp
 	}
 }
 
-func (n *Node) notifyDone(ctx context.Context, addr netip.AddrPort) {
+func (n *Node) notifyDone(ctx context.Context, p *peer) {
 	n.sbAdd()
 	select {
-	case n.done <- addr:
+	case n.done <- doneMsg{addr: p.addr, p: p}:
 	case <-ctx.Done():
 		n.sbDone()
 	}
