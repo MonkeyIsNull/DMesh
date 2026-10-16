@@ -34,17 +34,18 @@ func cmdSend(args []string) error {
 	chaos := fs.Bool("chaos", false, "rebind the local UDP socket mid-stream to force a pause/resume")
 	var peers addrList
 	fs.Var(&peers, "peer", "dial this peer directly, IP:PORT (repeatable; bypasses mDNS)")
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
 	}
-	if fs.NArg() < 2 {
-		return errors.New("usage: dmesh send <node-id> <file> [--chaos]")
+	if len(pos) < 2 {
+		return errors.New("usage: dmesh send [flags] <node-id> <file>")
 	}
-	peer, err := identity.ParseNodeID(fs.Arg(0))
+	peer, err := identity.ParseNodeID(pos[0])
 	if err != nil {
 		return fmt.Errorf("bad node id: %w", err)
 	}
-	path := fs.Arg(1)
+	path := pos[1]
 	f, err := os.Open(path)
 	if err != nil {
 		return err
@@ -115,8 +116,12 @@ func cmdRecv(args []string) error {
 	out := fs.String("out", ".", "directory to write the received file to")
 	var peers addrList
 	fs.Var(&peers, "peer", "dial this peer directly, IP:PORT (repeatable; bypasses mDNS)")
-	if err := fs.Parse(args); err != nil {
+	pos, err := parseInterspersed(fs, args)
+	if err != nil {
 		return err
+	}
+	if len(pos) > 0 {
+		return fmt.Errorf("usage: dmesh recv [flags] (unexpected argument %q)", pos[0])
 	}
 
 	n, cleanup, err := buildNode(*label, *port, *noMDNS, peers)
