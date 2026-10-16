@@ -762,6 +762,35 @@ func (n *Node) probeablePeerCountForTest() int {
 	return len(n.probeableIDsLocked())
 }
 
+// peerSessionPublishedForTest reports whether the peer keyed by id holds a
+// PUBLISHED carrier session: StateConnected AND p.sess != nil — the exact
+// probeable predicate (probeableIDsLocked). It is strictly stronger than
+// sessionUp, which checks StateConnected alone. handleAuth sets StateConnected
+// one barrier cycle BEFORE handleSessReady publishes p.sess (via the counted
+// sessReady hand-off), so there is a window in which the peer is StateConnected
+// but p.sess is still nil; a readiness poll gated only on StateConnected can
+// settle() inside that window. Gating on this predicate instead closes the gap,
+// because the sessReady publish is itself a counted hand-off: once this returns
+// true after a settle(), the carrier session is provably published. Read under
+// the renderer mutex.
+func (n *Node) peerSessionPublishedForTest(id identity.NodeID) bool {
+	n.mu.RLock()
+	defer n.mu.RUnlock()
+	p := n.byID[id]
+	return p != nil && p.state == StateConnected && p.sess != nil
+}
+
+// carrierPublished reports whether observer has PUBLISHED a live carrier session
+// to subject (not merely reached StateConnected). waitNodeConnected gates on
+// this on BOTH ends rather than on sessionUp: with the StateConnected-only gate,
+// settle() can return in the handleAuth->handleSessReady gap, after which the
+// relay-open helper's one-shot circOpen is silently dropped by sendCircControl
+// on its sess == nil guard and nothing re-dials, wedging setup to the deadline.
+// This mirrors allConnected's probeable gate.
+func carrierPublished(observer, subject *simNode) bool {
+	return observer.n.peerSessionPublishedForTest(subject.id.NodeID())
+}
+
 // memberCountForTest returns the number of non-self roster members.
 func (n *Node) memberCountForTest() int {
 	n.mu.RLock()

@@ -1296,10 +1296,12 @@ func (n *Node) runSession(ctx context.Context, p *peer, sess *transport.Session,
 	for {
 		select {
 		case <-ctx.Done():
+			n.drainInboxUnits(p)
 			sess.Close()
 			return
 		case b, ok := <-p.inbox:
 			if !ok {
+				n.drainInboxUnits(p)
 				sess.Close()
 				return
 			}
@@ -1308,6 +1310,37 @@ func (n *Node) runSession(ctx context.Context, p *peer, sess *transport.Session,
 			// frame regardless of which branch handles it.
 			n.processInboxFrame(ctx, p, sess, hello, fromID, fromDirect, b)
 			n.sbDone()
+		}
+	}
+}
+
+// drainInboxUnits retires the sim-barrier units for inbox frames this session
+// abandons when runSession exits via ctx.Done() or an inbox close, before the
+// loop's handleDone removes the peer. Every frame still BUFFERED in p.inbox was
+// enqueued by handleInbound/deliverRelayedInbound while the peer was
+// StateConnected and so carries exactly one counted unit (handshake-phase frames
+// are enqueued uncounted and are already drained by the handshake driver before
+// this post-handshake loop becomes cancellable), and the loop retires exactly
+// one unit per consumed frame — so draining the remainder with one sbDone each
+// exactly balances the count: it cannot over-retire (the non-blocking default
+// stops the instant the buffer is empty, and a closed channel yields ok == false
+// without a spurious sbDone) nor under-retire (it drains every buffered frame
+// before returning). It is a no-op in production (sbDone is a no-op there). This
+// touches only the channel and the barrier counter, never byAddr/byID, so peer-
+// table mutation stays on the loop.
+func (n *Node) drainInboxUnits(p *peer) {
+	if p.inbox == nil {
+		return
+	}
+	for {
+		select {
+		case _, ok := <-p.inbox:
+			if !ok {
+				return // channel closed and drained: no counted frames remain
+			}
+			n.sbDone()
+		default:
+			return // no more buffered frames
 		}
 	}
 }
@@ -1488,6 +1521,22 @@ func (n *Node) requestAuth(ctx context.Context, addr netip.AddrPort, res *transp
 		n.sbDone() // retire the loop's reply unit
 		return ok
 	case <-ctx.Done():
+		// This peer's own ctx was cancelled (collapse, half-open eviction,
+		// relayed teardown) before we read the reply. The first select already
+		// DELIVERED the authReq to the loop, and the loop sends exactly one reply
+		// for every request it processes (every handleAuth path calls
+		// sendAuthReply, each sbAdd-counted), so abandoning the reply here leaks
+		// that counted unit and settle() hangs on busy>0 (the dominant relay-sim
+		// barrier leak). Wait for the reply and retire it; only give up if the
+		// whole node is shutting down, when the loop may exit before processing
+		// the buffered request and no settle() is pending anyway (handleDone/
+		// shutdown is not barrier-asserted). The reply channel is buffered (cap 1)
+		// and single-use, so a reply already sent is drained immediately.
+		select {
+		case <-reply:
+			n.sbDone()
+		case <-n.runCtx.Done():
+		}
 		return false
 	}
 }

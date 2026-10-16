@@ -276,19 +276,26 @@ func TestCircuitAndStreamOverRelay(t *testing.T) {
 }
 
 // waitNodeConnected polls until a holds a connected (direct) session to b,
-// advancing the clock for seed-dial + handshake RTO timers.
+// advancing the clock for seed-dial + handshake RTO timers. Readiness is gated
+// on the carrier session being PUBLISHED on BOTH ends (carrierPublished), not
+// merely StateConnected (sessionUp): handleAuth sets StateConnected one barrier
+// cycle before handleSessReady publishes p.sess, so a StateConnected-only gate
+// lets settle() return in that gap — after which a one-shot circOpen fired by a
+// relay-open helper is silently dropped by sendCircControl (sess == nil) and
+// nothing re-dials, wedging relay setup to the deadline. See carrierPublished.
 func (m *simMesh) waitNodeConnected(a, b *simNode, timeout time.Duration) bool {
+	ready := func() bool { return carrierPublished(a, b) && carrierPublished(b, a) }
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		m.r.settle()
-		if sessionUp(a, b) && sessionUp(b, a) {
+		if ready() {
 			return true
 		}
 		m.clk.Advance(250 * time.Millisecond)
 		m.r.settle()
 		time.Sleep(time.Millisecond)
 	}
-	return sessionUp(a, b) && sessionUp(b, a)
+	return ready()
 }
 
 // TestRelayDumbPipeAndBinding proves the relay refuses to open a circuit to a
@@ -338,17 +345,46 @@ func TestCircuitChurn(t *testing.T) {
 		if !m.openRelayedSession(a, b) {
 			t.Fatalf("round %d: relayed session did not establish", i)
 		}
-		// Tear down both relayed peers by canceling via a fresh circClose from the
-		// relay: reap by advancing well past the idle timeout.
+		// Tear down both relayed peers: reap by advancing well past the idle timeout,
+		// then drive session-tick rounds until A's circuit map drains. The reap
+		// cancels the relayed peer's context on the loop, but its driver goroutine
+		// signals its exit - and the loop's handleDone that actually removes the entry
+		// from n.circuits - asynchronously, retired on a LATER barrier cycle. So the
+		// exact round at which the map reaches zero is goroutine-schedule dependent
+		// (load-sensitive): a fixed 2-round pump is occasionally too short on a slow/
+		// loaded runner (the CI flake). Bound the wait generously and settle-until the
+		// drain condition holds instead of asserting after a hard-coded count.
 		m.clk.Advance(m.nodeNatIdle(a) + time.Second)
-		m.sessTickAll()
-		m.r.settle()
-		// Allow teardown to propagate.
-		m.sessPump(250*time.Millisecond, 2)
-		if a.n.circuitCountForTest() != 0 {
+		if !m.settleUntilDrained(50, 250*time.Millisecond, func() bool {
+			return a.n.circuitCountForTest() == 0
+		}) {
 			t.Fatalf("round %d: A circuit map not drained: %d", i, a.n.circuitCountForTest())
 		}
 	}
+}
+
+// settleUntilDrained drives session-tick rounds on the injected clock (advancing
+// by d each round so any session RTO retransmit fires) until cond holds or
+// maxRounds elapse, returning whether cond was met. Each round fully settles the
+// mesh after every node's tick (the sessPump discipline), so this is a BOUNDED
+// wait on deterministic teardown PROGRESS, never a wall-clock timing window: a
+// circuit teardown cancels the relayed peer's context on the loop, but the driver
+// goroutine reports its exit asynchronously and the loop's handleDone (which
+// removes the entry from n.circuits) is retired on a later barrier cycle - so the
+// round at which the map drains is goroutine-schedule dependent and must not be
+// hard-coded to a fixed pump count. No SWIM phase/keepalive/fallback timer fires
+// on these advances (addNatNode sets ManualSwimPhases + DisableKeepalive + 24h
+// fallback), so the loop adds no gossip churn.
+func (m *simMesh) settleUntilDrained(maxRounds int, d time.Duration, cond func() bool) bool {
+	for i := 0; i < maxRounds; i++ {
+		if cond() {
+			return true
+		}
+		m.clk.Advance(d)
+		m.r.settle()
+		m.sessTickAll()
+	}
+	return cond()
 }
 
 // nodeNatIdle returns a node's circuit idle timeout.
