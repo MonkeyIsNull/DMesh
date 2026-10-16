@@ -66,6 +66,43 @@ func TestNetworkKeyEnvFallback(t *testing.T) {
 	}
 }
 
+func TestConfigDirOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv(EnvConfigDir, dir)
+
+	// Dir() returns the override verbatim (dirName is not appended).
+	got, err := Dir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != dir {
+		t.Fatalf("Dir() = %q, want %q", got, dir)
+	}
+
+	// Open() roots the handle at the override, so every file resolves under it.
+	c, err := Open()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Dir() != dir {
+		t.Fatalf("Open().Dir() = %q, want %q", c.Dir(), dir)
+	}
+	for _, p := range []string{c.IdentityPath(), c.IncarnationPath()} {
+		if filepath.Dir(p) != dir {
+			t.Fatalf("path %q not under override dir %q", p, dir)
+		}
+	}
+
+	// The network key also lands under the override.
+	good := make([]byte, NetworkKeyLen)
+	if err := c.SaveNetworkKey(good); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, networkKeyFile)); err != nil {
+		t.Fatalf("network key not written under override dir: %v", err)
+	}
+}
+
 func TestTrustListRoundTrip(t *testing.T) {
 	c := OpenAt(t.TempDir())
 	id1 := mustID(t)

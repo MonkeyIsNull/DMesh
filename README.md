@@ -95,6 +95,43 @@ the usual node flags (`--label`, `--port`, `--no-mdns`).
 > ships correct reliability + flow control with a fixed send window and RTO-only loss
 > recovery; congestion control and SACK are deferred throughput refinements.
 
+### Testing resume on one machine
+
+You can exercise the whole pause/resume path with two nodes on a single laptop, no
+second machine and no mDNS. Each instance points at its own config dir
+(`DMESH_CONFIG_DIR`) so it gets a distinct identity, key store, and incarnation, and
+both install the **same** network key. `--peer HOST:PORT` dials the other instance's
+endpoint directly (bypassing discovery); the identity is still learned from the Noise
+handshake, so the network key and allow-list apply exactly as over mDNS.
+
+```sh
+# one-time: generate a key in instance A, then install the SAME key in instance B
+DMESH_CONFIG_DIR=/tmp/dmesh-a dmesh network-key gen                 # prints a base64 key
+DMESH_CONFIG_DIR=/tmp/dmesh-b dmesh network-key set <base64-key>    # same key in B
+
+# note instance A's node id (B sends to it)
+DMESH_CONFIG_DIR=/tmp/dmesh-a dmesh id
+
+# terminal A — receiver, pinned to port 9001, no mDNS
+DMESH_CONFIG_DIR=/tmp/dmesh-a dmesh recv --no-mdns --port 9001 --out ./dl
+
+# terminal B — sender, dialing A directly with --peer, with in-process chaos
+DMESH_CONFIG_DIR=/tmp/dmesh-b dmesh send <A-node-id> ./bigfile --no-mdns --peer 127.0.0.1:9001 --chaos
+```
+
+`--chaos` rebinds the sender's local UDP socket mid-stream, forcing a real
+pause/resume (a roam onto a new endpoint and epoch) without any external disruption.
+When the transfer finishes, both ends print a SHA-256 — they must match, proving the
+bytes survived the pause/resume byte-exact.
+
+To exercise a genuine stall instead, pause the receiver process mid-transfer with a
+signal and resume it:
+
+```sh
+kill -STOP <recv-pid>   # freeze the receiver mid-stream; the sender pauses
+kill -CONT <recv-pid>   # resume it; the stream picks up from the acked offset
+```
+
 ## Build
 
 ```sh

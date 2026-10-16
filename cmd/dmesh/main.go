@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/signal"
 	"sort"
@@ -73,10 +74,10 @@ func usage() {
 
 usage:
   dmesh id
-  dmesh up [--label NAME] [--port N] [--no-mdns] [--trust-only]
+  dmesh up [--label NAME] [--port N] [--no-mdns] [--trust-only] [--peer IP:PORT]
   dmesh members [--label NAME] [--port N] [--no-mdns] [--for SECS]
-  dmesh send <node-id> <file> [--chaos]
-  dmesh recv [--out DIR]
+  dmesh send <node-id> <file> [--chaos] [--peer IP:PORT]
+  dmesh recv [--out DIR] [--peer IP:PORT]
   dmesh network-key gen|set|show|clear
   dmesh trust <node-id> [label]
   dmesh trust list
@@ -85,6 +86,30 @@ usage:
 }
 
 func openConfig() (*config.Config, error) { return config.Open() }
+
+// addrList is a repeatable IP:PORT flag (flag.Value) collecting static --peer
+// seed endpoints to dial directly, bypassing discovery. Parsing is by
+// netip.ParseAddrPort, so only IP literals are accepted (no hostname
+// resolution). Go's flag package has no native repeatable flag, so each
+// occurrence appends via Set.
+type addrList []netip.AddrPort
+
+func (a *addrList) String() string {
+	parts := make([]string, 0, len(*a))
+	for _, ap := range *a {
+		parts = append(parts, ap.String())
+	}
+	return strings.Join(parts, ",")
+}
+
+func (a *addrList) Set(v string) error {
+	ap, err := netip.ParseAddrPort(v)
+	if err != nil {
+		return fmt.Errorf("bad --peer %q (want IP:PORT): %w", v, err)
+	}
+	*a = append(*a, ap)
+	return nil
+}
 
 // cmdID prints this node's identity, generating it on first run.
 func cmdID(args []string) error {
@@ -119,6 +144,8 @@ func cmdUp(args []string) error {
 	port := fs.Int("port", 0, "UDP port to listen on (0 = ephemeral)")
 	noMDNS := fs.Bool("no-mdns", false, "disable mDNS discovery")
 	trustOnly := fs.Bool("trust-only", false, "accept only allow-listed peers (no trust-on-first-use)")
+	var peers addrList
+	fs.Var(&peers, "peer", "dial this peer directly, IP:PORT (repeatable; bypasses mDNS)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -177,6 +204,7 @@ func cmdUp(args []string) error {
 		EnforceAllowList: enforce,
 		SendGreeting:     true,
 		IncarnationPath:  c.IncarnationPath(),
+		SeedPeers:        peers,
 	})
 	if err != nil {
 		return err

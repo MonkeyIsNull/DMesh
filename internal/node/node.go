@@ -31,6 +31,7 @@ import (
 const (
 	defaultKeepaliveInterval = 5 * time.Second
 	defaultFallbackDialDelay = 1 * time.Second
+	defaultSeedDialInterval  = 1 * time.Second
 	halfOpenLimit            = 256
 )
 
@@ -46,6 +47,9 @@ type Config struct {
 	EnforceAllowList bool
 	// SendGreeting, if set, makes the initiator send a text ping after connect.
 	SendGreeting bool
+	// SeedPeers are static peer endpoints to dial directly, bypassing discovery;
+	// identity is learned via the handshake.
+	SeedPeers []netip.AddrPort
 
 	// --- v0.2 SWIM membership ---
 
@@ -123,6 +127,7 @@ type Node struct {
 	lastSeen  chan lsUpdate
 	done      chan doneMsg
 	forceDial chan forceDialReq
+	seedDial  chan netip.AddrPort
 
 	// --- v0.2 SWIM state, owned exclusively by the loop goroutine ---
 	roster       *swim.Roster
@@ -135,6 +140,7 @@ type Node struct {
 
 	incPath           string
 	selfEndpoint      netip.AddrPort
+	seedPeers         []netip.AddrPort
 	manualPhases      bool
 	disableKeepalive  bool
 	keepaliveInterval time.Duration
@@ -310,6 +316,7 @@ func New(cfg Config) (*Node, error) {
 		lastSeen:          make(chan lsUpdate, 256),
 		done:              make(chan doneMsg, 64),
 		forceDial:         make(chan forceDialReq, 64),
+		seedDial:          make(chan netip.AddrPort, 64),
 		params:            params,
 		gossip:            swim.NewBuffer(gossipBufferCap(params)),
 		detector:          swim.NewDetector(),
@@ -317,6 +324,7 @@ func New(cfg Config) (*Node, error) {
 		relayPending:      make(map[uint32]relayReq),
 		incPath:           cfg.IncarnationPath,
 		selfEndpoint:      selfEndpoint,
+		seedPeers:         canonAddrs(cfg.SeedPeers),
 		manualPhases:      cfg.ManualSwimPhases,
 		disableKeepalive:  cfg.DisableKeepalive,
 		keepaliveInterval: keepalive,
@@ -442,6 +450,13 @@ func (n *Node) Run(ctx context.Context) error {
 		}()
 	}
 
+	// Static seed dialer: directly dial the explicit --peer endpoints, bypassing
+	// discovery and its election. Identity is learned via the handshake.
+	if len(n.seedPeers) > 0 {
+		n.wg.Add(1)
+		go n.runSeedDialer(ctx)
+	}
+
 	// SWIM protocol-period phase driver (production only; tests inject phases).
 	if !n.manualPhases {
 		n.wg.Add(1)
@@ -563,6 +578,9 @@ func (n *Node) loop(ctx context.Context) {
 			n.sbDone()
 		case fd := <-n.forceDial:
 			n.handleForceDial(ctx, fd)
+			n.sbDone()
+		case addr := <-n.seedDial:
+			n.handleSeedDial(ctx, addr)
 			n.sbDone()
 		case sr := <-n.sessReady:
 			n.handleSessReady(sr)
@@ -732,6 +750,94 @@ func (n *Node) handleForceDial(ctx context.Context, fd forceDialReq) {
 	if p.state == StateDiscovered {
 		n.upgradeToInitiator(ctx, p)
 	}
+}
+
+const seedDialBackoffCap = 15 * time.Second
+
+// runSeedDialer periodically asks the event loop to ensure a dial is in
+// progress toward each static seed endpoint until it comes up. Seeds are an
+// election-free path: we always initiate, learning the peer identity from the
+// completed handshake. Timing rides the injected clock so the deterministic sim
+// drives it.
+//
+// This goroutine is NOT a writer of the peer table: it never touches byAddr and
+// never calls startInitiator (that would be a second writer, racing the loop's
+// unlocked byAddr reads). It only hands each seed address to the loop over
+// n.seedDial — mirroring handleHint's fallback-dial send onto n.forceDial,
+// including the sim-barrier accounting — and the loop's handleSeedDial does the
+// live-state check and the actual dial on the loop goroutine.
+//
+// Backoff: a seed that proves the PSK but is not allow-listed (--trust-only)
+// goes StateFailed and its byAddr entry is deleted, so a fixed cadence would
+// re-handshake it every interval forever. To avoid that spin, each seed carries
+// its own next-eligible-dial time on n.clk and a per-seed interval that starts
+// at the base (1s) and doubles on each tick that still finds it un-dialed, up to
+// a 15s cap. Cadence alone throttles the spin without adding a second byAddr
+// reader; the loop remains the sole arbiter of whether a dial actually happens.
+func (n *Node) runSeedDialer(ctx context.Context) {
+	defer n.wg.Done()
+	self := canonAddr(n.selfEndpoint)
+
+	// Per-seed backoff schedule, owned solely by this goroutine.
+	type seedSched struct {
+		interval time.Duration // current send interval (base..cap)
+		next     time.Time     // earliest clk time at which to send again
+	}
+	now := n.clk.Now()
+	sched := make(map[netip.AddrPort]*seedSched, len(n.seedPeers))
+	for _, addr := range n.seedPeers {
+		if addr == self {
+			continue // never dial ourselves
+		}
+		sched[addr] = &seedSched{interval: defaultSeedDialInterval, next: now}
+	}
+
+	t := n.clk.NewTimer(defaultSeedDialInterval)
+	defer t.Stop()
+	for {
+		now := n.clk.Now()
+		for addr, s := range sched {
+			if now.Before(s.next) {
+				continue // not yet eligible under its backoff schedule
+			}
+			n.sbAdd()
+			select {
+			case n.seedDial <- addr:
+			case <-ctx.Done():
+				n.sbDone()
+				return
+			}
+			// Grow this seed's interval (capped) so a seed that never connects is
+			// retried less and less often rather than every tick. handleSeedDial is
+			// a no-op for a seed already live, so an already-connected seed simply
+			// stops mattering; there is no need to reset here without a byAddr read.
+			s.interval *= 2
+			if s.interval > seedDialBackoffCap {
+				s.interval = seedDialBackoffCap
+			}
+			s.next = now.Add(s.interval)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C():
+			t.Reset(defaultSeedDialInterval)
+		}
+	}
+}
+
+// handleSeedDial runs ON the event loop, so it reads byAddr freely without n.mu.
+// If the seed already has a live (discovered/handshaking/connected) peer entry a
+// dial is already in progress or complete, so it does nothing; otherwise it
+// starts an initiator. A bare seed address carries no node ID; it is learned in
+// the handshake. This is the ONLY writer path for seed dials, preserving the
+// single-writer invariant on the peer table.
+func (n *Node) handleSeedDial(ctx context.Context, addr netip.AddrPort) {
+	if p := n.byAddr[addr]; p != nil &&
+		(p.state == StateDiscovered || p.state == StateHandshaking || p.state == StateConnected) {
+		return
+	}
+	n.startInitiator(ctx, addr, identity.NodeID{}, "")
 }
 
 // sendAuthReply answers a driver's auth request, counting the loop->driver
@@ -1136,6 +1242,18 @@ func (n *Node) Snapshot() []PeerView {
 // the plain IPv4 form key the same peer in the address table.
 func canonAddr(ap netip.AddrPort) netip.AddrPort {
 	return netip.AddrPortFrom(ap.Addr().Unmap(), ap.Port())
+}
+
+// canonAddrs canonicalizes a slice of addresses (for the static seed list).
+func canonAddrs(aps []netip.AddrPort) []netip.AddrPort {
+	if len(aps) == 0 {
+		return nil
+	}
+	out := make([]netip.AddrPort, 0, len(aps))
+	for _, ap := range aps {
+		out = append(out, canonAddr(ap))
+	}
+	return out
 }
 
 func randIndex() uint32 {

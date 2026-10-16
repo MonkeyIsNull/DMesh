@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/netip"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +32,8 @@ func cmdSend(args []string) error {
 	port := fs.Int("port", 0, "UDP port to listen on (0 = ephemeral)")
 	noMDNS := fs.Bool("no-mdns", false, "disable mDNS discovery")
 	chaos := fs.Bool("chaos", false, "rebind the local UDP socket mid-stream to force a pause/resume")
+	var peers addrList
+	fs.Var(&peers, "peer", "dial this peer directly, IP:PORT (repeatable; bypasses mDNS)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -52,7 +55,7 @@ func cmdSend(args []string) error {
 		return err
 	}
 
-	n, cleanup, err := buildNode(*label, *port, *noMDNS)
+	n, cleanup, err := buildNode(*label, *port, *noMDNS, peers)
 	if err != nil {
 		return err
 	}
@@ -110,11 +113,13 @@ func cmdRecv(args []string) error {
 	port := fs.Int("port", 0, "UDP port to listen on (0 = ephemeral)")
 	noMDNS := fs.Bool("no-mdns", false, "disable mDNS discovery")
 	out := fs.String("out", ".", "directory to write the received file to")
+	var peers addrList
+	fs.Var(&peers, "peer", "dial this peer directly, IP:PORT (repeatable; bypasses mDNS)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	n, cleanup, err := buildNode(*label, *port, *noMDNS)
+	n, cleanup, err := buildNode(*label, *port, *noMDNS, peers)
 	if err != nil {
 		return err
 	}
@@ -219,8 +224,9 @@ func runChaos(ctx context.Context, n *node.Node, port int) {
 }
 
 // buildNode constructs a node with the real clock, mandatory network key, and
-// (optionally) mDNS discovery. The returned cleanup closes discovery.
-func buildNode(label string, port int, noMDNS bool) (*node.Node, func(), error) {
+// (optionally) mDNS discovery. Any static seed endpoints are dialed directly,
+// bypassing discovery. The returned cleanup closes discovery.
+func buildNode(label string, port int, noMDNS bool, seeds []netip.AddrPort) (*node.Node, func(), error) {
 	c, err := openConfig()
 	if err != nil {
 		return nil, nil, err
@@ -260,6 +266,7 @@ func buildNode(label string, port int, noMDNS bool) (*node.Node, func(), error) 
 		Clock:            clock.Real{},
 		EnforceAllowList: len(trusted) > 0,
 		IncarnationPath:  c.IncarnationPath(),
+		SeedPeers:        seeds,
 	})
 	if err != nil {
 		cleanup()
