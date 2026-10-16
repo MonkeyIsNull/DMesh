@@ -38,11 +38,21 @@ const (
 	// preferred; an environment variable can leak via /proc and inherited
 	// environments.
 	EnvNetworkKey = "DMESH_NETWORK_KEY"
+
+	// EnvConfigDir, when set, overrides the per-OS config directory with an
+	// explicit path used AS the instance dir (dirName is not appended). It lets
+	// two DMesh instances on one machine hold distinct identities/keys.
+	EnvConfigDir = "DMESH_CONFIG_DIR"
 )
 
 // Dir resolves the DMesh config directory (e.g. ~/Library/Application
 // Support/dmesh on macOS, $XDG_CONFIG_HOME/dmesh or ~/.config/dmesh on Linux).
 func Dir() (string, error) {
+	// An explicit DMESH_CONFIG_DIR is the instance dir verbatim: the user points
+	// straight at it, so dirName is NOT joined on.
+	if v := strings.TrimSpace(os.Getenv(EnvConfigDir)); v != "" {
+		return v, nil
+	}
 	base, err := os.UserConfigDir()
 	if err != nil {
 		return "", fmt.Errorf("config: resolve user config dir: %w", err)
