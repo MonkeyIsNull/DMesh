@@ -87,6 +87,24 @@ usage:
 
 func openConfig() (*config.Config, error) { return config.Open() }
 
+// parseInterspersed parses fs allowing flags to appear before, after, or between
+// positional arguments (stdlib flag stops at the first non-flag; this resumes).
+// Returns the positional args in order.
+func parseInterspersed(fs *flag.FlagSet, args []string) ([]string, error) {
+	var positionals []string
+	for {
+		if err := fs.Parse(args); err != nil {
+			return nil, err
+		}
+		if fs.NArg() == 0 {
+			break
+		}
+		positionals = append(positionals, fs.Arg(0))
+		args = fs.Args()[1:]
+	}
+	return positionals, nil
+}
+
 // addrList is a repeatable IP:PORT flag (flag.Value) collecting static --peer
 // seed endpoints to dial directly, bypassing discovery. Parsing is by
 // netip.ParseAddrPort, so only IP literals are accepted (no hostname
