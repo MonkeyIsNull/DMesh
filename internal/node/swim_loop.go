@@ -65,7 +65,7 @@ func (n *Node) startProbe(probeable []identity.NodeID) {
 	if p == nil || p.sess == nil {
 		return
 	}
-	n.sealSend(p.addr, p.sess, n.buildSwimFrame(swim.KindPing, seq, identity.NodeID{}, netip.AddrPort{}))
+	n.sealSend(p, p.sess, n.buildSwimFrame(swim.KindPing, seq, identity.NodeID{}, netip.AddrPort{}))
 }
 
 // indirectProbe asks K random relays to ping-req the still-unacked target.
@@ -77,12 +77,12 @@ func (n *Node) indirectProbe() {
 	relays := n.pickRelays(target, n.params.K)
 	var targetEP netip.AddrPort
 	n.mu.Lock()
-	if m := n.byID[target]; m != nil {
+	if m := n.byID[target]; m != nil && !isPseudoAddr(m.addr) {
 		targetEP = m.addr
 	}
 	n.mu.Unlock()
 	for _, r := range relays {
-		n.sealSend(r.addr, r.sess, n.buildSwimFrame(swim.KindPingReq, seq, target, targetEP))
+		n.sealSend(r, r.sess, n.buildSwimFrame(swim.KindPingReq, seq, target, targetEP))
 	}
 }
 
@@ -116,7 +116,7 @@ func (n *Node) handleSwimIn(in swimInbound) {
 	var regossip []swim.Update
 	var hints []discovery.PeerHint
 	n.mu.Lock()
-	var reconAddr netip.AddrPort
+	var reconP *peer
 	var reconSess *transport.Session
 	var reconBurst []swim.Update
 	if p := n.byAddr[in.fromAddr]; p != nil {
@@ -130,7 +130,7 @@ func (n *Node) handleSwimIn(in swimInbound) {
 		// handshake, and it is bounded (one burst) and self-limiting (once the
 		// peer refutes, we see it Alive and stop).
 		if st, ok := n.roster.State(in.fromID); ok && (st == swim.StateSuspect || st == swim.StateDead) && p.sess != nil && !n.disableJoinSync {
-			reconAddr = p.addr
+			reconP = p
 			reconSess = p.sess
 			reconBurst = n.roster.GossipRows(n.params.MaxPiggyback)
 		}
@@ -168,12 +168,16 @@ func (n *Node) handleSwimIn(in swimInbound) {
 			}
 		}
 	}
+	// Parse and merge the node-owned signed candidate extension that rides after
+	// the swim payload (invisible to v0.3 peers; see mergeCandExt). Done under the
+	// same lock as roster apply so the admitted-member gate is consistent.
+	n.mergeCandExt(in.body, env, now)
 	sends := n.params.RetransmitCount(n.roster.Size())
 	n.mu.Unlock()
 
 	if reconSess != nil && len(reconBurst) > 0 {
 		env := swim.Envelope{Kind: swim.KindSync, Seq: n.nextSeq(), Updates: reconBurst}
-		n.sealSend(reconAddr, reconSess, encodeSwim(swim.Encode(env)))
+		n.sealSend(reconP, reconSess, n.swimWithCands(swim.Encode(env), reconBurst))
 	}
 	for _, u := range regossip {
 		n.gossip.Add(u, sends)
@@ -209,7 +213,7 @@ func (n *Node) replyAck(toID identity.NodeID, seq uint32) {
 	if p == nil || p.sess == nil {
 		return
 	}
-	n.sealSend(p.addr, p.sess, n.buildSwimFrame(swim.KindAck, seq, identity.NodeID{}, netip.AddrPort{}))
+	n.sealSend(p, p.sess, n.buildSwimFrame(swim.KindAck, seq, identity.NodeID{}, netip.AddrPort{}))
 }
 
 // handlePingReq is the relay path: if we hold a live session to the target, ping
@@ -233,7 +237,7 @@ func (n *Node) handlePingReq(fromID identity.NodeID, env swim.Envelope, now time
 		target:    target,
 		deadline:  now.Add(n.params.T),
 	}
-	n.sealSend(tp.addr, tp.sess, n.buildSwimFrame(swim.KindPing, newSeq, identity.NodeID{}, netip.AddrPort{}))
+	n.sealSend(tp, tp.sess, n.buildSwimFrame(swim.KindPing, newSeq, identity.NodeID{}, netip.AddrPort{}))
 }
 
 // forwardRelayAck, on an ack to one of our relay pings, forwards a ping-req-ack
@@ -248,7 +252,7 @@ func (n *Node) forwardRelayAck(seq uint32) {
 	if rq == nil || rq.sess == nil {
 		return
 	}
-	n.sealSend(rq.addr, rq.sess, n.buildSwimFrame(swim.KindPingReqAck, rp.reqSeq, rp.target, netip.AddrPort{}))
+	n.sealSend(rq, rq.sess, n.buildSwimFrame(swim.KindPingReqAck, rp.reqSeq, rp.target, netip.AddrPort{}))
 }
 
 // nudgeStaleConnected sends a reconciliation burst to every member we hold as
@@ -279,7 +283,7 @@ func (n *Node) nudgeStaleConnected() {
 	// us — one direct round trip, independent of round-robin gossip timing.
 	for _, p := range targets {
 		env := swim.Envelope{Kind: swim.KindPing, Seq: n.nextSeq(), Updates: burst}
-		n.sealSend(p.addr, p.sess, encodeSwim(swim.Encode(env)))
+		n.sealSend(p, p.sess, n.swimWithCands(swim.Encode(env), burst))
 	}
 }
 
@@ -306,10 +310,17 @@ func (n *Node) handleSessReady(m sessReadyMsg) {
 	}
 	p.sess = m.sess
 	peerID := p.nodeID
-	addr := p.addr
+	sendP := p
+	// Never record a relayed peer's undialable pseudo-address as its roster dial
+	// hint; use a zero endpoint so the real candidate store remains the source of
+	// a dial hint for a relay-only peer.
+	obsAddr := p.addr
+	if isPseudoAddr(obsAddr) {
+		obsAddr = netip.AddrPort{}
+	}
 	var obs *swim.Update
 	if !peerID.IsZero() {
-		obs = n.roster.Observe(peerID, addr, now)
+		obs = n.roster.Observe(peerID, obsAddr, now)
 	}
 	sends := n.params.RetransmitCount(n.roster.Size())
 	var burst []swim.Update
@@ -327,7 +338,7 @@ func (n *Node) handleSessReady(m sessReadyMsg) {
 	if len(burst) > 0 {
 		seq := n.nextSeq()
 		env := swim.Envelope{Kind: swim.KindSync, Seq: seq, Updates: burst}
-		n.sealSend(addr, m.sess, encodeSwim(swim.Encode(env)))
+		n.sealSend(sendP, m.sess, n.swimWithCands(swim.Encode(env), burst))
 	}
 
 	// v0.3 resume hook: a (re)connected transport for this identity is now bound.
@@ -352,7 +363,7 @@ func (n *Node) handleLeave() {
 	for _, p := range conns {
 		seq := n.nextSeq()
 		env := swim.Envelope{Kind: swim.KindSync, Seq: seq, Updates: []swim.Update{left}}
-		n.sealSend(p.addr, p.sess, encodeSwim(swim.Encode(env)))
+		n.sealSend(p, p.sess, n.swimWithCands(swim.Encode(env), []swim.Update{left}))
 	}
 }
 
@@ -368,7 +379,7 @@ func (n *Node) nextSeq() uint32 {
 func (n *Node) buildSwimFrame(kind uint8, seq uint32, target identity.NodeID, targetEP netip.AddrPort) []byte {
 	updates := n.gossip.Pick(n.params.MaxPiggyback)
 	env := swim.Envelope{Kind: kind, Seq: seq, Target: target, TargetEndpoint: targetEP, Updates: updates}
-	return encodeSwim(swim.Encode(env))
+	return n.swimWithCands(swim.Encode(env), updates)
 }
 
 // probeableIDsLocked returns the IDs of peers with a live authenticated session
@@ -414,6 +425,11 @@ func (n *Node) pickRelays(target identity.NodeID, k int) []*peer {
 	cand := make([]*peer, 0, len(n.byID))
 	for id, p := range n.byID {
 		if id == target {
+			continue
+		}
+		// A relayed peer is not usable as a SWIM indirect-probe relay this phase
+		// (its own liveness is relay-coupled); exclude it.
+		if p.path.kind == pathRelay {
 			continue
 		}
 		if p.state == StateConnected && p.sess != nil {

@@ -32,6 +32,14 @@ type Params struct {
 	// MaxPlaintext (1184) minus the 28-byte session+data header
 	// (msgSession 1 + subtype 1 + sessionID 16 + offset 8 + len 2), so one DATA
 	// frame is always one datagram with no fragmentation.
+	//
+	// v0.4 relay budget: a DATA frame may be wrapped as a relay circData and
+	// re-sealed on the A<->R carrier session, adding a 74-byte worst-case
+	// overhead (msgRelay 1 + relay ver 1 + sub 1 + circuitID 8 + inner data
+	// header 19 + inner AEAD 16 + inner msgSession/subData header 28). So the
+	// effective MaxChunk must stay <= 1110 for a wrapped frame to remain a single
+	// datagram; the node clamps it unconditionally (see node.New) regardless of
+	// any override, and the default below is already within that bound.
 	MaxChunk int
 	// SendWindow bounds the total unacked send buffer (bytes queued but not yet
 	// cumulatively acked) per direction. Admission blocks a writer once it would
@@ -77,7 +85,7 @@ type Params struct {
 // DefaultParams returns the production session parameters.
 func DefaultParams() Params {
 	return Params{
-		MaxChunk:           1156,
+		MaxChunk:           1100,
 		SendWindow:         256 * 1024,
 		RecvWindow:         256 * 1024,
 		InitialRTO:         200 * time.Millisecond,

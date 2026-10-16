@@ -171,9 +171,52 @@ gossip. `dmesh members` prints that roster once and exits.
 > mDNS. CI and the offline test suite never touch multicast; the real-mDNS path is
 > only exercised under `DMESH_MDNS_E2E=1`.
 
+## NAT traversal / relay (v0.4)
+
+Off-LAN reachability without hole punching, in two layers:
+
+- **Serverless reflexive discovery.** A node asks a couple of NAT-capable peers
+  "what source address do you see for me?" and learns its NAT-translated public
+  address with no STUN server. A reflexive address is advertised and dialed only
+  after **two independent observers corroborate the same `ip:port`**, and a node
+  never retransmits to an address that produced no inbound packet — so a single
+  spoofed answer causes zero emitted traffic. Candidate sets are **Ed25519-signed
+  by the subject node** (its NodeID *is* the signing key) and ride as a trailing,
+  independently-versioned extension on the existing gossip frames, invisible to
+  older peers; a relayer cannot forge another node's set.
+- **Relay circuits.** Run a reachable node with `dmesh up --relay`. Credentialed
+  members open a **circuit** through it and the Noise session is carried end to
+  end over that circuit; the relay is a **dumb pipe** that forwards sealed frames
+  it cannot read, only between the two bound endpoints of a circuit, bounded by
+  per-circuit, per-requester, and global byte buckets plus circuit caps, and it
+  never dials on demand (no reflection/amplification to a non-member). A relayed
+  session resumes by identity, so it migrates to a direct path the moment one
+  becomes available (**prefer-direct**).
+
+> **Relay trust assumption:** a relay learns who-talks-to-whom, the traffic
+> volume and timing, and can selectively drop — but never reads the end-to-end
+> encrypted payload. Resume-by-identity plus prefer-direct limit a relay's
+> leverage to the window a session actually spends relayed.
+
+> **Security scope of reflexive candidates (read this):** a reflexive `ip:port`
+> is promoted into a node's signed, advertised candidate set only after
+> **`MinReflexObservers` (default 2) independent observers corroborate the same
+> address**, so a *lone* spoofed observation is **defended** — it never reaches
+> the threshold, and the observation itself causes zero emitted traffic toward
+> the claimed address. It does **not** defend against **collusion**:
+> `MinReflexObservers` or more colluding credentialed observers can agree on an
+> attacker-chosen `ip:port` and promote it into the victim's set, which aims
+> honest peers' re-dial *handshake* traffic at that address — a small reflection
+> primitive (the handshake simply fails there, since the attacker holds no key).
+> This is by design at a 2-observer threshold. The present mitigation is the
+> credential/allow-list bound on *who* can be an observer at all (`MinReflexObservers`
+> is the tunable threshold). The real fix — **signed per-observer observations**,
+> so a reflexive address carries proof of who observed it, and/or a higher
+> threshold — is deferred alongside the per-update membership signatures above.
+
 ## Roadmap
 
-Done: gossip membership (SWIM, v0.2); **durable/resumable sessions** (the hero feature, v0.3). Later milestones, in order: NAT traversal / relay (off-LAN data reachability) → topology dashboard → virtual-interface (TUN) mode. Membership hardening — per-update signatures (forged-membership defense), signed invites / a tiny CA (Sybil/eclipse) — rides the signed-invite milestone.
+Done: gossip membership (SWIM, v0.2); **durable/resumable sessions** (the hero feature, v0.3); **NAT traversal / relay** (reflexive discovery + relay circuits, v0.4). Later milestones, in order: hole punching (direct off-LAN paths) → topology dashboard → virtual-interface (TUN) mode. Membership hardening — per-update signatures (forged-membership defense), signed invites / a tiny CA (Sybil/eclipse) — rides the signed-invite milestone.
 
 ## License
 

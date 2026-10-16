@@ -83,6 +83,11 @@ func (c *simConn) Close() error {
 
 type linkKey struct{ src, dst netip.AddrPort }
 
+type egressKey struct {
+	internal netip.AddrPort
+	remoteIP netip.Addr
+}
+
 type router struct {
 	mu           sync.Mutex
 	conns        map[netip.AddrPort]*simConn
@@ -93,19 +98,79 @@ type router struct {
 	isolated     map[netip.AddrPort]bool
 	blocked      map[linkKey]bool
 
+	// --- v0.4 NAT model (realm separation + endpoint-independent full-cone with
+	// address-dependent filtering). All maps default to the "public realm 0, no
+	// NAT" behaviour, so every pre-v0.4 test is unaffected. ---
+	realm      map[netip.AddrPort]int            // addr -> realm (absent == 0, public)
+	external   map[netip.AddrPort]netip.AddrPort // internal -> sticky external (NAT egress map)
+	internalOf map[netip.AddrPort]netip.AddrPort // external -> internal (NAT ingress map)
+	egress     map[egressKey]bool                // internal egressed toward remote IP (filter)
+	attempts   map[netip.AddrPort]int            // count of send() calls targeting each dst
+
 	b *simBarrier
 	t *testing.T
 }
 
 func newRouter(t *testing.T, seed int64, b *simBarrier) *router {
 	return &router{
-		conns:    make(map[netip.AddrPort]*simConn),
-		rng:      rand.New(rand.NewSource(seed)),
-		isolated: make(map[netip.AddrPort]bool),
-		blocked:  make(map[linkKey]bool),
-		b:        b,
-		t:        t,
+		conns:      make(map[netip.AddrPort]*simConn),
+		rng:        rand.New(rand.NewSource(seed)),
+		isolated:   make(map[netip.AddrPort]bool),
+		blocked:    make(map[linkKey]bool),
+		realm:      make(map[netip.AddrPort]int),
+		external:   make(map[netip.AddrPort]netip.AddrPort),
+		internalOf: make(map[netip.AddrPort]netip.AddrPort),
+		egress:     make(map[egressKey]bool),
+		attempts:   make(map[netip.AddrPort]int),
+		b:          b,
+		t:          t,
 	}
+}
+
+// attemptsTo returns how many send() calls targeted dst (counting dropped
+// sends), for "emits nothing to the victim" assertions.
+func (r *router) attemptsTo(dst netip.AddrPort) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.attempts[dst]
+}
+
+// realmOf returns an address's realm (0 = public internet by default).
+func (r *router) realmOf(a netip.AddrPort) int { return r.realm[a] }
+
+// natTranslate applies the sim NAT model under r.mu and returns the apparent
+// source to stamp, the conn-table key to deliver to, and whether the delivery is
+// dropped (realm separation or an unsolicited-inbound filter miss). The caller
+// holds r.mu.
+func (r *router) natTranslate(src, dst netip.AddrPort) (deliverSrc, deliverDst netip.AddrPort, drop bool) {
+	deliverSrc, deliverDst = src, dst
+	_, srcInternal := r.external[src]
+	// Egress NAT: an internal source leaving its realm is rewritten to its sticky
+	// external address, and the egress toward the remote IP is recorded so the
+	// return path passes the address-dependent filter.
+	if srcInternal && r.realmOf(dst) != r.realmOf(src) {
+		deliverSrc = r.external[src]
+		r.egress[egressKey{internal: src, remoteIP: dst.Addr()}] = true
+	}
+	// Ingress NAT: a packet to an external mapped address is reverse-translated to
+	// the internal address, dropped unless the internal node egressed toward the
+	// (apparent) sender's IP first (unsolicited inbound is dropped).
+	if internal, ok := r.internalOf[dst]; ok {
+		if !r.egress[egressKey{internal: internal, remoteIP: deliverSrc.Addr()}] {
+			return deliverSrc, deliverDst, true
+		}
+		deliverDst = internal
+		return deliverSrc, deliverDst, false
+	}
+	// Realm separation: a direct delivery to an internal address only succeeds
+	// from the same realm (cross-realm private dial fails - the basis for
+	// "relay is mandatory").
+	if _, dstInternal := r.external[dst]; dstInternal {
+		if r.realmOf(src) != r.realmOf(dst) {
+			return deliverSrc, deliverDst, true
+		}
+	}
+	return deliverSrc, deliverDst, false
 }
 
 func (r *router) register(addr netip.AddrPort) *simConn {
@@ -127,11 +192,22 @@ func (r *router) unregister(addr netip.AddrPort) {
 
 func (r *router) send(src, dst netip.AddrPort, data []byte) {
 	r.mu.Lock()
+	r.attempts[dst]++
 	drop := r.isolated[src] || r.isolated[dst] || r.blocked[linkKey{src, dst}]
+	// NAT model: realm separation + endpoint-independent translation + address-
+	// dependent filtering. Applied before loss/dup and before any b.add so a
+	// NAT/filter drop creates no barrier unit (matching the loss path). For the
+	// default public realm with no NAT boxes this is an identity transform.
+	deliverSrc, deliverDst := src, dst
+	if !drop {
+		var natDrop bool
+		deliverSrc, deliverDst, natDrop = r.natTranslate(src, dst)
+		drop = natDrop
+	}
 	if !drop && r.lossPermille > 0 && r.rng.Intn(1000) < r.lossPermille {
 		drop = true
 	}
-	dc := r.conns[dst]
+	dc := r.conns[deliverDst]
 	// Duplicate a fraction of the DELIVERED packets so the receiver sees genuine
 	// on-wire duplicates (exercising the seq/offset dedup path), not only the
 	// go-back-N retransmits loss produces. The RNG is drawn under the lock so the
@@ -154,7 +230,7 @@ func (r *router) send(src, dst netip.AddrPort, data []byte) {
 	for i := 0; i < copies; i++ {
 		r.b.add(1)
 		select {
-		case dc.queue <- simPkt{src: src, data: data}:
+		case dc.queue <- simPkt{src: deliverSrc, data: data}:
 		default:
 			r.b.done() // queue full: the packet is dropped, so retire its unit
 		}
@@ -381,6 +457,7 @@ func (m *simMesh) addNode(t *testing.T, label string, opts func(cfg *Config)) *s
 		SelfEndpoint:      addr,
 		SwimRand:          rng,
 		ManualSwimPhases:  true,
+		ManualNatProbe:    true,
 		DisableKeepalive:  true,
 		FallbackDialDelay: 24 * time.Hour,
 	}
@@ -430,6 +507,7 @@ func (m *simMesh) restartNode(sn *simNode) *simNode {
 		SelfEndpoint:      addr,
 		SwimRand:          rng,
 		ManualSwimPhases:  true,
+		ManualNatProbe:    true,
 		DisableKeepalive:  true,
 		FallbackDialDelay: 24 * time.Hour,
 	}

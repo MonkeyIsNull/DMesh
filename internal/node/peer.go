@@ -64,6 +64,12 @@ type peer struct {
 	state    LinkState
 	lastSeen time.Time
 
+	// path records how frames reach this peer (direct UDP or wrapped over a relay
+	// circuit). Like every other peer field it is written ONLY by the event loop
+	// and read off-loop (by sendToPeer and the renderer) ONLY under n.mu. The zero
+	// value is pathDirect, so a normal peer needs no initialization.
+	path peerPath
+
 	// sess is the live transport session, published to the loop by the driver
 	// over sessReady once the handshake completes. The loop owns this field (so
 	// all peer-field writes stay single-writer) and Seals SWIM frames directly
@@ -80,4 +86,8 @@ type PeerView struct {
 	State    LinkState
 	LastSeen time.Time
 	HasID    bool
+	// Path is "direct" or "relay"; Relay names the carrier identity for a relayed
+	// peer (zero otherwise).
+	Path  string
+	Relay identity.NodeID
 }
