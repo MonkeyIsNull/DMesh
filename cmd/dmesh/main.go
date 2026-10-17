@@ -162,6 +162,7 @@ func cmdUp(args []string) error {
 	port := fs.Int("port", 0, "UDP port to listen on (0 = ephemeral)")
 	noMDNS := fs.Bool("no-mdns", false, "disable mDNS discovery")
 	trustOnly := fs.Bool("trust-only", false, "accept only allow-listed peers (no trust-on-first-use)")
+	relay := fs.Bool("relay", false, "act as a NAT-traversal relay for credentialed members (dumb pipe)")
 	var peers addrList
 	fs.Var(&peers, "peer", "dial this peer directly, IP:PORT (repeatable; bypasses mDNS)")
 	if err := fs.Parse(args); err != nil {
@@ -223,6 +224,7 @@ func cmdUp(args []string) error {
 		SendGreeting:     true,
 		IncarnationPath:  c.IncarnationPath(),
 		SeedPeers:        peers,
+		RelayCapable:     *relay,
 	})
 	if err != nil {
 		return err

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/MonkeyIsNull/DMesh/internal/identity"
+	"github.com/MonkeyIsNull/DMesh/internal/nat"
 	"github.com/MonkeyIsNull/DMesh/internal/session"
 	"github.com/MonkeyIsNull/DMesh/internal/swim"
 	"github.com/MonkeyIsNull/DMesh/internal/transport"
@@ -132,6 +133,12 @@ func (n *Node) handleSessTick() {
 		a := ls.s.OnTick(now, rs, known, alive)
 		n.applyAction(ls, a, now)
 	}
+	// Reap idle relay circuits (relay side) and idle relayed peers (endpoint
+	// side) on the same injected-clock tick. No new timer goroutine.
+	n.reapCircuits(now)
+	// Sweep unacked circuit-opens so a lost circOpen/circOpenAck cannot wedge
+	// relay fallback to the target (the next tick re-issues the open).
+	n.sweepPendingOpens(now)
 }
 
 func (n *Node) handleSessIn(in sessInbound) {
@@ -304,16 +311,17 @@ func (n *Node) sealSessionFrame(peer identity.NodeID, f session.Frame) {
 	n.mu.RLock()
 	p := n.byID[peer]
 	var sess *transport.Session
-	var addr netip.AddrPort
 	if p != nil {
 		sess = p.sess
-		addr = p.addr
 	}
 	n.mu.RUnlock()
-	if sess == nil {
+	if p == nil || sess == nil {
 		return
 	}
-	n.sealSend(addr, sess, encodeSession(session.Encode(f)))
+	// sealSend re-resolves p.path/carrier under n.mu.RLock inside sendToPeer, so a
+	// relayed session's frames ride the circuit and a direct session's go straight
+	// to p.addr - transparently across a path migration.
+	n.sealSend(p, sess, encodeSession(session.Encode(f)))
 }
 
 // --- registry helpers (all mutate under n.mu for the renderer/accessors) ----
@@ -420,12 +428,22 @@ func (n *Node) transportAlive(peer identity.NodeID) bool {
 	return p != nil && p.sess != nil && p.state == StateConnected
 }
 
+// peerEndpointLocked returns a REAL, dialable endpoint for a peer, NEVER a
+// relayed peer's fdme:: pseudo-address (which is structurally undialable). It
+// prefers the live direct address, then the best corroborated candidate from the
+// signed candidate store, then the roster dial hint - each filtered so a
+// pseudo-address can never leak into a dial. The caller holds n.mu.
 func (n *Node) peerEndpointLocked(peer identity.NodeID) (netip.AddrPort, string) {
-	if p := n.byID[peer]; p != nil && p.addr.IsValid() {
+	if p := n.byID[peer]; p != nil && p.addr.IsValid() && !isPseudoAddr(p.addr) {
 		return p.addr, p.label
 	}
+	if cs := n.candStore[peer]; cs != nil {
+		if ep := nat.Primary(cs.Cands); ep.IsValid() && !isPseudoAddr(ep) {
+			return ep, ""
+		}
+	}
 	for _, r := range n.roster.Rows() {
-		if r.ID == peer && r.Endpoint.IsValid() {
+		if r.ID == peer && r.Endpoint.IsValid() && !isPseudoAddr(r.Endpoint) {
 			return r.Endpoint, ""
 		}
 	}
@@ -445,12 +463,20 @@ func (n *Node) redialSession(peer identity.NodeID) {
 		return
 	}
 	ep, label := n.peerEndpointLocked(peer)
-	busy := n.byAddr[ep] != nil
+	busy := ep.IsValid() && n.byAddr[ep] != nil
 	n.mu.Unlock()
-	if !ep.IsValid() || busy {
+	if ep.IsValid() {
+		if !busy {
+			// Prefer a real direct candidate (architecture-high: never
+			// startInitiator on a pseudo-address).
+			n.startInitiator(n.runCtx, ep, peer, label)
+		}
 		return
 	}
-	n.startInitiator(n.runCtx, ep, peer, label)
+	// No real direct candidate is known: fall back to re-opening a relay circuit
+	// through a connected CapRelay member. This is a distinct loop path keyed off
+	// a relay-capable member; it never dials the pseudo-address.
+	n.reopenCircuit(peer)
 }
 
 // --- resume hook (called from handleSessReady) ------------------------------

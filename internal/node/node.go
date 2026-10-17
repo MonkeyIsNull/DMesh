@@ -18,11 +18,13 @@ import (
 	mrand "math/rand"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/MonkeyIsNull/DMesh/internal/clock"
 	"github.com/MonkeyIsNull/DMesh/internal/discovery"
 	"github.com/MonkeyIsNull/DMesh/internal/identity"
+	"github.com/MonkeyIsNull/DMesh/internal/nat"
 	"github.com/MonkeyIsNull/DMesh/internal/session"
 	"github.com/MonkeyIsNull/DMesh/internal/swim"
 	"github.com/MonkeyIsNull/DMesh/internal/transport"
@@ -99,6 +101,27 @@ type Config struct {
 	// DisableGossipDial suppresses feeding gossip-learned endpoints back into
 	// discovery (used to isolate pure gossip convergence).
 	DisableGossipDial bool
+
+	// --- v0.4 NAT traversal / relay ---
+
+	// RelayCapable makes this node advertise CapRelay and act as a relay for
+	// credentialed members (CLI --relay).
+	RelayCapable bool
+	// NatParams overrides the NAT/relay tunables; the zero value uses
+	// nat.DefaultParams().
+	NatParams nat.Params
+	// CandidateSource supplies this node's local host candidate addresses. Nil
+	// uses the bound local address; the deterministic sim injects a fixed set so
+	// startup is reproducible.
+	CandidateSource func() []netip.AddrPort
+	// ManualNatProbe disables the internal reflex-probe timer goroutine; the test
+	// harness injects probes on InjectNatProbe instead (mirrors ManualSwimPhases).
+	ManualNatProbe bool
+	// CircuitRand injects the circuit-id RNG. Nil seeds from crypto/rand
+	// (unpredictable ids in production); the sim injects a fixed seed for
+	// deterministic ids. Authorization is endpoint-binding, not the id, so a
+	// predictable id in test does not weaken security.
+	CircuitRand *mrand.Rand
 }
 
 // Node is a running DMesh node.
@@ -165,6 +188,63 @@ type Node struct {
 
 	manualSessionTick   bool
 	sessionTickInterval time.Duration
+
+	// --- v0.4 NAT traversal / relay, owned exclusively by the loop goroutine ---
+	natParams       nat.Params
+	relayRole       bool
+	candidateSource func() []netip.AddrPort
+	manualNatProbe  bool
+
+	// candStore holds every known node's latest verified signed candidate set.
+	// selfCand/selfCandGen are this node's own set and its independent monotonic
+	// generation. All loop-owned; the renderer reads them under n.mu.
+	candStore   map[identity.NodeID]*nat.CandSet
+	selfCand    nat.CandSet
+	selfCandGen uint64
+
+	// reflexObs holds per-observer reflexive observations of our own external
+	// address, kept internal until MinReflexObservers independent observers agree
+	// (anti-reflection). Never signed or dialed until promoted. reflexPromoted is
+	// the set of corroborated reflexive addresses that have been promoted into the
+	// advertised self candidate set.
+	reflexObs      map[identity.NodeID]netip.AddrPort
+	reflexPromoted map[netip.AddrPort]bool
+	reflexRespAt   map[identity.NodeID]time.Time
+	reflexSpoof    netip.AddrPort // test-only: force reflexResp to report this addr
+
+	// circuitTbl is the relay-side circuit registry (only populated when this node
+	// relays). circuits maps a circuit id to the local relayed *peer when this
+	// node is an endpoint of that circuit.
+	circuitTbl *nat.CircuitTable
+	circuits   map[nat.CircuitID]*peer
+	circuitRnd *mrand.Rand
+
+	// relayedHalf bounds relayed peers (in-progress handshakes and established
+	// sessions) per relay, SEPARATE from the direct half-open table (n.half), so a
+	// malicious relay minting circuit ids can never evict in-progress direct
+	// handshakes. relayedTotal is the global relayed-peer bound. Both gate a
+	// target node's unconsented circuit state.
+	relayedHalf  map[identity.NodeID]int
+	relayedTotal int
+
+	// pendingOpens tracks circuit-open requests this node issued as an opener,
+	// keyed by the reqNonce, so a circOpenAck is matched to its intended target.
+	pendingOpens map[uint32]pendingOpen
+
+	natIn     chan natInbound
+	circuitIn chan circuitInbound
+	natProbe  chan struct{}
+	circDial  chan circDialReq
+
+	// fwd is the bounded off-loop relay forwarder: the loop resolves the carrier
+	// session pointer and hands (sess, circuit, payload) here for the Seal+WriteTo
+	// so the loop never seals a relay-forwarded DATA packet inline.
+	fwd chan fwdReq
+	// relayFwd counts circuit frames this node has admitted to the forwarder (i.e.
+	// accepted past the per-circuit/per-requester/global byte buckets). It is a
+	// relay egress metric; it is written on the loop and read for status/tests, so
+	// it is an atomic.
+	relayFwd atomic.Uint64
 	// runCtx is the node's run context, captured at the top of Run so loop
 	// handlers can spawn transport dials (forced re-dials) with the right lifetime
 	// without threading ctx through every call. Written once before the loop
@@ -358,6 +438,37 @@ func New(cfg Config) (*Node, error) {
 		n.sessionTickInterval = 25 * time.Millisecond
 	}
 
+	// --- v0.4 NAT traversal / relay init ---
+	n.natParams = cfg.NatParams.WithDefaults()
+	n.relayRole = cfg.RelayCapable
+	n.candidateSource = cfg.CandidateSource
+	n.manualNatProbe = cfg.ManualNatProbe
+	n.candStore = make(map[identity.NodeID]*nat.CandSet)
+	n.reflexObs = make(map[identity.NodeID]netip.AddrPort)
+	n.reflexPromoted = make(map[netip.AddrPort]bool)
+	n.reflexRespAt = make(map[identity.NodeID]time.Time)
+	n.circuitTbl = nat.NewCircuitTable(n.natParams)
+	n.circuits = make(map[nat.CircuitID]*peer)
+	n.relayedHalf = make(map[identity.NodeID]int)
+	n.pendingOpens = make(map[uint32]pendingOpen)
+	n.natIn = make(chan natInbound, 128)
+	n.circuitIn = make(chan circuitInbound, 128)
+	n.natProbe = make(chan struct{}, 8)
+	n.circDial = make(chan circDialReq, 32)
+	n.fwd = make(chan fwdReq, 256)
+	n.circuitRnd = cfg.CircuitRand
+	if n.circuitRnd == nil {
+		n.circuitRnd = mrand.New(mrand.NewSource(cryptoSeed()))
+	}
+	// Clamp the effective MaxChunk to the relay budget unconditionally (not via
+	// WithDefaults, which only fills a zero field) so a wrapped relay frame is
+	// always a single datagram regardless of any SessionParams override.
+	if n.sessParams.MaxChunk > maxRelayChunk {
+		n.sessParams.MaxChunk = maxRelayChunk
+	}
+	// Seed our own candidate set (host candidates + caps) so it rides on gossip.
+	n.initSelfCandidates()
+
 	var persist func(uint64) error
 	if cfg.IncarnationPath != "" {
 		persist = func(v uint64) error { return swim.SaveIncarnation(cfg.IncarnationPath, v) }
@@ -468,6 +579,18 @@ func (n *Node) Run(ctx context.Context) error {
 		n.wg.Add(1)
 		go n.runSessionTicks(ctx)
 	}
+
+	// Reflex-probe driver (production only; tests inject probes). It only signals
+	// the loop, exactly like runPhases; all NAT work happens on the loop.
+	if !n.manualNatProbe {
+		n.wg.Add(1)
+		go n.runNatProbe(ctx)
+	}
+
+	// Bounded off-loop relay forwarder: does Seal+WriteTo for forwarded circData
+	// so the loop never seals a relay-forwarded DATA packet inline.
+	n.wg.Add(1)
+	go n.runForwarder(ctx)
 
 	n.loop(ctx)
 	// Unblock readLoop, which is parked in a blocking ReadFrom, so Run can
@@ -603,6 +726,18 @@ func (n *Node) loop(ctx context.Context) {
 			n.sbDone()
 		case <-n.sessTick:
 			n.handleSessTick()
+			n.sbDone()
+		case in := <-n.natIn:
+			n.handleNatIn(in)
+			n.sbDone()
+		case in := <-n.circuitIn:
+			n.handleCircuitIn(ctx, in)
+			n.sbDone()
+		case <-n.natProbe:
+			n.handleNatProbe()
+			n.sbDone()
+		case d := <-n.circDial:
+			n.handleCircDial(d)
 			n.sbDone()
 		}
 	}
@@ -848,39 +983,76 @@ func (n *Node) sendAuthReply(a *authReq, ok bool) {
 	a.reply <- ok
 }
 
+// pendingCircClose is a teardown intent collected under n.mu in handleAuth and
+// emitted AFTER the lock is released. handleAuth runs under n.mu.Lock() and the
+// RWMutex is not reentrant, so sealing a circClose inline (sendToPeer RLock)
+// would self-deadlock; this defers the emission exactly as handleSessReady
+// defers its sends.
+type pendingCircClose struct {
+	relay   identity.NodeID
+	circuit nat.CircuitID
+}
+
 func (n *Node) handleAuth(a *authReq) {
 	n.mu.Lock()
-	defer n.mu.Unlock()
 	p := n.byAddr[a.addr]
 	if p == nil {
 		n.sendAuthReply(a, false)
+		n.mu.Unlock()
 		return
 	}
 	if n.policy(a.res.PeerNodeID) == transport.TrustReject {
 		p.state = StateFailed
 		n.sendAuthReply(a, false)
+		n.mu.Unlock()
 		return
 	}
-	// Identity-keyed collapse: if a connected session already exists for this
-	// authenticated node ID, normally drop the newer one (keep exactly one
-	// stable session per peer identity).
-	//
-	// Exception — handshake-as-ground-truth (v0.2): if the roster regards the
-	// existing session's peer as NOT alive (Suspect/Dead), a freshly-completed
-	// authenticated handshake is proof the peer is back (e.g. a restart, often
-	// from a new address). Replace the stale session rather than reject the new
-	// one, which would otherwise be blocked forever by a session the mesh has
-	// already given up on. A node cannot forge a completed Noise handshake, so
-	// this is sound ground truth.
+
+	// Confirm-identity-post-handshake (security-medium): the relay-supplied target
+	// identity used to pre-key a relayed peer is an unauthenticated hint. If the
+	// Noise-authenticated identity does not equal the intended target, a malicious
+	// relay cross-wired us to a different member; tear the relayed peer down and
+	// close the circuit (after unlock).
+	var closeAfter *pendingCircClose
+	if p.path.kind == pathRelay && !p.nodeID.IsZero() && p.nodeID != a.res.PeerNodeID {
+		p.state = StateFailed
+		if p.cancel != nil {
+			p.cancel()
+		}
+		closeAfter = &pendingCircClose{relay: p.path.relay, circuit: p.path.circuit}
+		n.sendAuthReply(a, false)
+		n.mu.Unlock()
+		n.emitCircClose(closeAfter)
+		return
+	}
+
+	// Identity-keyed collapse with a prefer-direct TOTAL order (direct > relay),
+	// applied regardless of which session connected first, retaining the
+	// stale-roster handshake-as-ground-truth exception for same-kind collisions
+	// (v0.2). A node cannot forge a completed Noise handshake, so replacing a
+	// stale same-kind session is sound ground truth.
 	if ex := n.byID[a.res.PeerNodeID]; ex != nil && ex != p && ex.state == StateConnected {
-		st, known := n.roster.State(a.res.PeerNodeID)
-		staleExisting := known && st != swim.StateAlive
-		if !staleExisting {
+		if !n.resolveCollapse(a.res.PeerNodeID, ex, p) {
+			// The new session loses. If it is relayed, schedule its circClose.
+			p.state = StateFailed
+			if p.cancel != nil {
+				p.cancel()
+			}
+			if p.path.kind == pathRelay {
+				closeAfter = &pendingCircClose{relay: p.path.relay, circuit: p.path.circuit}
+			}
 			n.sendAuthReply(a, false)
+			n.mu.Unlock()
+			n.emitCircClose(closeAfter)
 			return
 		}
+		// The new session wins: tear down the existing one (handleDone cleans its
+		// address keys). If the existing is relayed, schedule its circClose.
 		if ex.cancel != nil {
-			ex.cancel() // tear down the stale session; handleDone will clean its address keys
+			ex.cancel()
+		}
+		if ex.path.kind == pathRelay {
+			closeAfter = &pendingCircClose{relay: ex.path.relay, circuit: ex.path.circuit}
 		}
 	}
 	p.nodeID = a.res.PeerNodeID
@@ -893,6 +1065,23 @@ func (n *Node) handleAuth(a *authReq) {
 	// table filled - the opposite of what the half-open bound is for.
 	n.half.Remove(a.addr)
 	n.sendAuthReply(a, true)
+	n.mu.Unlock()
+	n.emitCircClose(closeAfter)
+}
+
+// resolveCollapse decides, for a same-identity collision between an existing
+// connected peer ex and a newly-authenticated peer newp, whether the new one
+// wins. The caller holds n.mu. The order is: direct beats relay regardless of
+// arrival order; for a same-kind collision the new one wins only if the roster
+// regards the identity as stale (not Alive).
+func (n *Node) resolveCollapse(authID identity.NodeID, ex, newp *peer) bool {
+	exRelay := ex.path.kind == pathRelay
+	newRelay := newp.path.kind == pathRelay
+	if exRelay != newRelay {
+		return !newRelay // keep the new one iff it is the direct path
+	}
+	st, known := n.roster.State(authID)
+	return known && st != swim.StateAlive
 }
 
 func (n *Node) handleLastSeen(u lsUpdate) {
@@ -931,6 +1120,22 @@ func (n *Node) handleDone(d doneMsg) {
 	}
 	delete(n.byAddr, d.addr)
 	n.half.Remove(d.addr)
+	// Single teardown edge for a relayed peer: byAddr/byID/circuits are removed
+	// atomically on the loop, so n.circuits never leaks a reaped peer.
+	if p.path.kind == pathRelay {
+		if n.circuits[p.path.circuit] == p {
+			delete(n.circuits, p.path.circuit)
+		}
+		if c := n.relayedHalf[p.path.relay]; c > 0 {
+			n.relayedHalf[p.path.relay] = c - 1
+			if n.relayedHalf[p.path.relay] == 0 {
+				delete(n.relayedHalf, p.path.relay)
+			}
+		}
+		if n.relayedTotal > 0 {
+			n.relayedTotal--
+		}
+	}
 }
 
 // --- peer creation ----------------------------------------------------------
@@ -1021,7 +1226,7 @@ func (n *Node) startResponder(ctx context.Context, addr netip.AddrPort) *peer {
 func (n *Node) driveInitiator(ctx context.Context, p *peer) {
 	defer n.wg.Done()
 	defer n.notifyDone(ctx, p)
-	snd := transport.AddrSender{Conn: n.packetConn(), Addr: p.addr}
+	snd := pathSender{n: n, p: p}
 	res, err := transport.DoInitiator(ctx, n.clk, snd, p.inbox, n.self, n.psk, p.localIndex)
 	if err != nil {
 		return
@@ -1036,7 +1241,7 @@ func (n *Node) driveInitiator(ctx context.Context, p *peer) {
 func (n *Node) driveResponder(ctx context.Context, p *peer) {
 	defer n.wg.Done()
 	defer n.notifyDone(ctx, p)
-	snd := transport.AddrSender{Conn: n.packetConn(), Addr: p.addr}
+	snd := pathSender{n: n, p: p}
 	res, err := transport.DoResponder(ctx, n.clk, snd, p.inbox, n.self, n.psk, p.localIndex)
 	if err != nil {
 		return
@@ -1053,7 +1258,7 @@ func (n *Node) driveResponder(ctx context.Context, p *peer) {
 // ack was lost) is answered idempotently by re-sending HELLO.
 func (n *Node) runSession(ctx context.Context, p *peer, sess *transport.Session, firstPayload []byte, initiator bool) {
 	hello := encodeHello(n.self.Label)
-	n.sealSend(p.addr, sess, hello)
+	n.sealSend(p, sess, hello)
 
 	// Publish the live session to the loop so it owns p.sess and can treat the
 	// peer as SWIM-probeable + join-sync with it. The authenticated peer ID was
@@ -1071,31 +1276,71 @@ func (n *Node) runSession(ctx context.Context, p *peer, sess *transport.Session,
 
 	if !n.disableKeepalive {
 		n.wg.Add(1)
-		go n.keepalive(ctx, p.addr, sess)
+		go n.keepalive(ctx, p, sess)
 	}
 
+	// A relayed peer's frames all arrive over a circuit; a direct peer's all
+	// arrive on a real UDP source. The path kind is set on the loop at peer
+	// creation, strictly before this driver goroutine was spawned, and is not
+	// flipped in place for a peer's lifetime (migration replaces the peer), so
+	// reading it once here is race-free and stable for every frame below.
+	fromDirect := p.path.kind == pathDirect
+
 	if initiator && n.greeting {
-		n.sealSend(p.addr, sess, encodeText("hello from "+n.self.NodeID().Short()))
+		n.sealSend(p, sess, encodeText("hello from "+n.self.NodeID().Short()))
 	}
 	if firstPayload != nil {
-		n.handleApp(ctx, p.addr, fromID, firstPayload)
+		n.handleApp(ctx, p.addr, fromID, fromDirect, firstPayload)
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
+			n.drainInboxUnits(p)
 			sess.Close()
 			return
 		case b, ok := <-p.inbox:
 			if !ok {
+				n.drainInboxUnits(p)
 				sess.Close()
 				return
 			}
 			// Every inbox frame reaching runSession was counted by handleInbound
 			// (the peer is Connected), so retire exactly one unit per consumed
 			// frame regardless of which branch handles it.
-			n.processInboxFrame(ctx, p, sess, hello, fromID, b)
+			n.processInboxFrame(ctx, p, sess, hello, fromID, fromDirect, b)
 			n.sbDone()
+		}
+	}
+}
+
+// drainInboxUnits retires the sim-barrier units for inbox frames this session
+// abandons when runSession exits via ctx.Done() or an inbox close, before the
+// loop's handleDone removes the peer. Every frame still BUFFERED in p.inbox was
+// enqueued by handleInbound/deliverRelayedInbound while the peer was
+// StateConnected and so carries exactly one counted unit (handshake-phase frames
+// are enqueued uncounted and are already drained by the handshake driver before
+// this post-handshake loop becomes cancellable), and the loop retires exactly
+// one unit per consumed frame — so draining the remainder with one sbDone each
+// exactly balances the count: it cannot over-retire (the non-blocking default
+// stops the instant the buffer is empty, and a closed channel yields ok == false
+// without a spurious sbDone) nor under-retire (it drains every buffered frame
+// before returning). It is a no-op in production (sbDone is a no-op there). This
+// touches only the channel and the barrier counter, never byAddr/byID, so peer-
+// table mutation stays on the loop.
+func (n *Node) drainInboxUnits(p *peer) {
+	if p.inbox == nil {
+		return
+	}
+	for {
+		select {
+		case _, ok := <-p.inbox:
+			if !ok {
+				return // channel closed and drained: no counted frames remain
+			}
+			n.sbDone()
+		default:
+			return // no more buffered frames
 		}
 	}
 }
@@ -1104,24 +1349,24 @@ func (n *Node) runSession(ctx context.Context, p *peer, sess *transport.Session,
 // downstream work it triggers (a HELLO re-send, a SWIM envelope routed to the
 // loop) is counted inside this call, before runSession retires the frame's own
 // unit, so the barrier never dips to zero mid-reaction.
-func (n *Node) processInboxFrame(ctx context.Context, p *peer, sess *transport.Session, hello []byte, fromID identity.NodeID, b []byte) {
+func (n *Node) processInboxFrame(ctx context.Context, p *peer, sess *transport.Session, hello []byte, fromID identity.NodeID, fromDirect bool, b []byte) {
 	kind, err := transport.Classify(b)
 	if err != nil {
 		return
 	}
 	if kind == transport.KindHandshake {
 		// Retransmitted handshake frame: re-send HELLO as the ack.
-		n.sealSend(p.addr, sess, hello)
+		n.sealSend(p, sess, hello)
 		return
 	}
 	pt, err := sess.OpenFrame(b)
 	if err != nil {
 		return // replay/forged/undecryptable - drop cheaply
 	}
-	n.handleApp(ctx, p.addr, fromID, pt)
+	n.handleApp(ctx, p.addr, fromID, fromDirect, pt)
 }
 
-func (n *Node) keepalive(ctx context.Context, addr netip.AddrPort, sess *transport.Session) {
+func (n *Node) keepalive(ctx context.Context, p *peer, sess *transport.Session) {
 	defer n.wg.Done()
 	t := n.clk.NewTimer(n.keepaliveInterval)
 	defer t.Stop()
@@ -1130,7 +1375,7 @@ func (n *Node) keepalive(ctx context.Context, addr netip.AddrPort, sess *transpo
 		case <-ctx.Done():
 			return
 		case <-t.C():
-			if !n.sealSend(addr, sess, encodeKeepalive()) {
+			if !n.sealSend(p, sess, encodeKeepalive()) {
 				return
 			}
 			t.Reset(n.keepaliveInterval)
@@ -1138,19 +1383,90 @@ func (n *Node) keepalive(ctx context.Context, addr netip.AddrPort, sess *transpo
 	}
 }
 
-// sealSend encrypts and transmits one application message. It returns false if
-// the session can no longer send (closed or nonce-exhausted).
-func (n *Node) sealSend(addr netip.AddrPort, sess *transport.Session, msg []byte) bool {
+// sealSend encrypts one application message on the peer's session and transmits
+// it through the single sendToPeer chokepoint, so it reaches a relayed peer over
+// its circuit instead of its (undialable) pseudo-address. It returns false if
+// the session can no longer send (closed or nonce-exhausted) or no route exists.
+func (n *Node) sealSend(p *peer, sess *transport.Session, msg []byte) bool {
 	frame, err := sess.Seal(msg)
 	if err != nil {
 		return false
 	}
-	return n.packetConn().WriteTo(frame, addr) == nil
+	return n.sendToPeer(p, frame)
 }
 
-func (n *Node) handleApp(ctx context.Context, addr netip.AddrPort, fromID identity.NodeID, pt []byte) {
+// sendToPeer is the single per-peer WriteTo chokepoint for every outbound
+// datagram: keepalive, SWIM, handshake, hello/greeting, and session frames. It
+// snapshots the route atomically under n.mu.RLock() - reading p.path AND
+// resolving the carrier session + relay address in one guarded read, mirroring
+// sealSessionFrame - then seals/WriteTo OUTSIDE the lock. For pathDirect it
+// writes frame straight to p.addr. For pathRelay it wraps frame as a circData
+// and seals it on the carrier (A<->R) session, writing to the relay's real
+// address; the carrier is resolved fresh per send (never cached), so an A<->R
+// re-handshake or roam mid-relay is picked up automatically.
+//
+// Single-writer satisfaction: no off-loop caller (keepalive, driver, pathSender)
+// ever reads p.path or byID[relay] without this RLock, and this method never
+// mutates peer-table state, so it is a pure reader alongside the single-writer
+// loop.
+func (n *Node) sendToPeer(p *peer, frame []byte) bool {
+	n.mu.RLock()
+	path := p.path
+	directAddr := p.addr
+	var carrier *transport.Session
+	var relayAddr netip.AddrPort
+	if path.kind == pathRelay {
+		if rp := n.byID[path.relay]; rp != nil {
+			carrier = rp.sess
+			relayAddr = rp.addr
+		}
+	}
+	n.mu.RUnlock()
+
+	if path.kind == pathRelay {
+		if carrier == nil {
+			return false // carrier re-dialing; OnTick/driver retransmits
+		}
+		wrapped := encodeRelay(nat.EncodeCircData(path.circuit, frame))
+		// Runtime MTU guard: never emit a frame the carrier would reject with an
+		// opaque Seal error; drop-with-reason (the budget clamp on MaxChunk keeps
+		// data frames within bound, so this only trips on a mis-sized control
+		// frame).
+		if len(wrapped) > transport.MaxPlaintext {
+			return false
+		}
+		outer, err := carrier.Seal(wrapped)
+		if err != nil {
+			return false
+		}
+		return n.packetConn().WriteTo(outer, relayAddr) == nil
+	}
+	return n.packetConn().WriteTo(frame, directAddr) == nil
+}
+
+func (n *Node) handleApp(ctx context.Context, addr netip.AddrPort, fromID identity.NodeID, fromDirect bool, pt []byte) {
 	m, ok := decodeMessage(pt)
 	if !ok {
+		return
+	}
+	if m.typ == msgNat {
+		body := append([]byte(nil), m.body...)
+		n.sbAdd()
+		select {
+		case n.natIn <- natInbound{fromID: fromID, fromAddr: addr, fromDirect: fromDirect, body: body}:
+		case <-ctx.Done():
+			n.sbDone()
+		}
+		return
+	}
+	if m.typ == msgRelay {
+		body := append([]byte(nil), m.body...)
+		n.sbAdd()
+		select {
+		case n.circuitIn <- circuitInbound{fromID: fromID, fromAddr: addr, fromDirect: fromDirect, body: body}:
+		case <-ctx.Done():
+			n.sbDone()
+		}
 		return
 	}
 	if m.typ == msgSwim {
@@ -1205,15 +1521,38 @@ func (n *Node) requestAuth(ctx context.Context, addr netip.AddrPort, res *transp
 		n.sbDone() // retire the loop's reply unit
 		return ok
 	case <-ctx.Done():
+		// This peer's own ctx was cancelled (collapse, half-open eviction,
+		// relayed teardown) before we read the reply. The first select already
+		// DELIVERED the authReq to the loop, and the loop sends exactly one reply
+		// for every request it processes (every handleAuth path calls
+		// sendAuthReply, each sbAdd-counted), so abandoning the reply here leaks
+		// that counted unit and settle() hangs on busy>0 (the dominant relay-sim
+		// barrier leak). Wait for the reply and retire it; only give up if the
+		// whole node is shutting down, when the loop may exit before processing
+		// the buffered request and no settle() is pending anyway (handleDone/
+		// shutdown is not barrier-asserted). The reply channel is buffered (cap 1)
+		// and single-use, so a reply already sent is drained immediately.
+		select {
+		case <-reply:
+			n.sbDone()
+		case <-n.runCtx.Done():
+		}
 		return false
 	}
 }
 
+// notifyDone reports a driver's exit to the loop so handleDone can retire the
+// peer's table entries. It guards on the NODE run context, not the driver's own
+// (per-peer) context: a per-peer cancel (collapse, half-open eviction, relayed
+// idle/close teardown) is exactly when the driver's ctx is already Done, and the
+// cleanup MUST still be delivered then - only a full node shutdown (runCtx
+// canceled, loop exiting) legitimately skips it. Guarding on the driver ctx here
+// would leak the peer's byAddr/byID/circuits entries on every per-peer teardown.
 func (n *Node) notifyDone(ctx context.Context, p *peer) {
 	n.sbAdd()
 	select {
 	case n.done <- doneMsg{addr: p.addr, p: p}:
-	case <-ctx.Done():
+	case <-n.runCtx.Done():
 		n.sbDone()
 	}
 }
@@ -1225,14 +1564,20 @@ func (n *Node) Snapshot() []PeerView {
 	defer n.mu.RUnlock()
 	out := make([]PeerView, 0, len(n.byAddr))
 	for _, p := range n.byAddr {
-		out = append(out, PeerView{
+		pv := PeerView{
 			NodeID:   p.nodeID,
 			Label:    p.label,
 			Endpoint: p.addr,
 			State:    p.state,
 			LastSeen: p.lastSeen,
 			HasID:    !p.nodeID.IsZero(),
-		})
+			Path:     "direct",
+		}
+		if p.path.kind == pathRelay {
+			pv.Path = "relay"
+			pv.Relay = p.path.relay
+		}
+		out = append(out, pv)
 	}
 	return out
 }
